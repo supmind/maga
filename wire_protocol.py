@@ -1,4 +1,5 @@
 # coding:utf-8
+import logging
 import os
 import hashlib
 import asyncio
@@ -51,6 +52,8 @@ BLOCK = 1
 MAX_SIZE = 2 ** 14
 # BitTorrent协议头部信息，用于构建握手消息
 BT_HEADER = b"\x13BitTorrent protocol\x00\x00\x00\x00\x00\x10\x00\x01"
+
+logger = logging.getLogger(__name__)
 
 def random_id() -> bytes:
     """
@@ -138,7 +141,7 @@ class WirePeerClient:
         while not self.closing:
             try:
                 # 从socket读取4字节的消息长度前缀
-                data = await asyncio.wait_for(self.reader.readexactly(4), timeout=60)
+                data = await asyncio.wait_for(self.reader.readexactly(4), timeout=30) # Timeout reduced to 30s
                 msg_len = struct.unpack(">I", data)[0]
 
                 if msg_len == 0:
@@ -146,21 +149,20 @@ class WirePeerClient:
                     await self.queue.put((MessageType.KEEP_ALIVE, None))
                     continue
                 # 读取消息体
-                data = await asyncio.wait_for(self.reader.readexactly(msg_len), timeout=60)
+                data = await asyncio.wait_for(self.reader.readexactly(msg_len), timeout=30) # Timeout reduced to 30s
                 msg_id = data[0]
                 payload = data[1:]
+                logger.debug(f"Received message type {msg_id} from {self.host}:{self.port} with payload length {len(payload)}")
                 # 将消息放入队列
                 await self.queue.put((msg_id, payload))
             except (ConnectionResetError, ConnectionRefusedError,
                     asyncio.exceptions.IncompleteReadError,
                     asyncio.TimeoutError, OSError) as e:
-                # 发生连接错误或超时，关闭连接
-                # print(f"Error reading messages from {self.host}:{self.port}: {e}")
+                logger.warning(f"Error reading messages from {self.host}:{self.port}: {e}")
                 await self.close()
                 break
             except Exception as e:
-                # 其他未知错误，关闭连接
-                # print(f"Unknown error reading messages from {self.host}:{self.port}: {e}")
+                logger.error(f"Unknown error reading messages from {self.host}:{self.port}: {e}", exc_info=True)
                 await self.close()
                 break
 
@@ -191,12 +193,10 @@ class WirePeerClient:
                 await self.writer.drain()
         except (ConnectionResetError, ConnectionRefusedError,
                 asyncio.TimeoutError, OSError, AttributeError) as e:
-            # 发生连接错误或超时，关闭连接
-            # print(f"Error sending message to {self.host}:{self.port}: {e}")
+            logger.warning(f"Error sending message to {self.host}:{self.port}: {e}")
             await self.close()
         except Exception as e:
-            # 其他未知错误，关闭连接
-            # print(f"Unknown error sending message to {self.host}:{self.port}: {e}")
+            logger.error(f"Unknown error sending message to {self.host}:{self.port}: {e}", exc_info=True)
             await self.close()
 
     async def _connect(self) -> bool:
@@ -208,16 +208,15 @@ class WirePeerClient:
             # 连接到远端peer
             fut = asyncio.open_connection(self.host, self.port)
             self.reader, self.writer = await asyncio.wait_for(fut, timeout=5) # 设置连接超时
+            logger.debug(f"Successfully connected to {self.host}:{self.port}")
             # 启动读取消息的协程
             asyncio.ensure_future(self.read_messages(), loop=self.loop)
             return True
         except (ConnectionRefusedError, OSError, asyncio.TimeoutError) as e:
-            # 连接被拒绝、OS错误或超时
-            # print(f"Connection to {self.host}:{self.port} failed: {e}")
+            logger.warning(f"Connection to {self.host}:{self.port} failed: {e}")
             return False
         except Exception as e:
-            # 其他未知错误
-            # print(f"Failed to connect to {self.host}:{self.port}: {e}")
+            logger.error(f"Failed to connect to {self.host}:{self.port}: {e}", exc_info=True)
             return False
 
     async def do_handshake(self) -> bool:
@@ -231,48 +230,44 @@ class WirePeerClient:
         # 构建并发送握手消息
         handshake_msg = BT_HEADER + self.info_hash + self.my_id
         await self.send_message(MessageType.HANDSHAKE, handshake_msg)
+        logger.debug(f"Sent handshake to {self.host}:{self.port}")
 
         try:
             # 等待接收远端peer的握手响应
             data = await asyncio.wait_for(self.reader.readexactly(BT_PROTOCOL_LEN + 1 + 8 + 20 + 20), timeout=10)
         except (asyncio.exceptions.IncompleteReadError, asyncio.TimeoutError, ConnectionResetError) as e:
-            # 读取超时或连接重置
-            # print(f"Handshake with {self.host}:{self.port} failed: {e}")
+            logger.warning(f"Handshake with {self.host}:{self.port} failed during read: {e}")
             await self.close()
             return False
         except Exception as e:
-            # 其他未知错误
-            # print(f"Handshake with {self.host}:{self.port} unknown error: {e}")
+            logger.error(f"Handshake with {self.host}:{self.port} unknown error during read: {e}", exc_info=True)
             await self.close()
             return False
 
         # 解析握手响应
         protocol_len = data[0]
         if protocol_len != BT_PROTOCOL_LEN:
-            # 协议长度不匹配
-            # print(f"Handshake protocol length mismatch with {self.host}:{self.port}")
+            logger.warning(f"Handshake protocol length mismatch with {self.host}:{self.port}. Expected {BT_PROTOCOL_LEN}, got {protocol_len}")
             await self.close()
             return False
 
         protocol_name = data[1:1 + protocol_len]
         if protocol_name != BT_PROTOCOL:
-            # 协议名称不匹配
-            # print(f"Handshake protocol name mismatch with {self.host}:{self.port}")
+            logger.warning(f"Handshake protocol name mismatch with {self.host}:{self.port}. Expected {BT_PROTOCOL}, got {protocol_name}")
             await self.close()
             return False
 
         # reserved_bytes = data[1 + protocol_len:1 + protocol_len + 8] # 保留字节
         info_hash_recv = data[1 + protocol_len + 8:1 + protocol_len + 8 + 20]
         if info_hash_recv != self.info_hash:
-            # info_hash不匹配
-            # print(f"Handshake info_hash mismatch with {self.host}:{self.port}")
+            logger.warning(f"Handshake info_hash mismatch with {self.host}:{self.port}")
             await self.close()
             return False
 
         # 获取远端peer的ID
         self.remote_id = data[1 + protocol_len + 8 + 20:1 + protocol_len + 8 + 20 + 20]
         self.handshake_recv = True
-        # print(f"Handshake with {self.host}:{self.port} successful. Remote ID: {binascii.hexlify(self.remote_id)}")
+        logger.debug(f"Handshake with {self.host}:{self.port} successful. Remote ID: {binascii.hexlify(self.remote_id).decode()}")
         return True
 
     async def send_ext_handshake(self) -> None:
@@ -287,7 +282,7 @@ class WirePeerClient:
         # 发送扩展消息，其中EXT_ID是扩展协议ID，EXT_HANDSHAKE_ID是扩展握手消息ID
         await self.send_message(MessageType.EXTENSION, bytes([EXT_HANDSHAKE_ID]) + payload)
         self.ext_handshake_send = True
-        # print(f"Sent extension handshake to {self.host}:{self.port}")
+        logger.debug(f"Sent extension handshake to {self.host}:{self.port}")
 
     async def send_interested(self) -> None:
         """
@@ -299,7 +294,7 @@ class WirePeerClient:
         # 发送Interested消息
         await self.send_message(MessageType.INTERESTED)
         self.interested_send = True
-        # print(f"Sent Interested message to {self.host}:{self.port}")
+        logger.debug(f"Sent Interested message to {self.host}:{self.port}")
 
     async def request_metadata_piece(self, piece_index: int) -> None:
         """
@@ -313,7 +308,7 @@ class WirePeerClient:
         payload = bencoder.encode({"msg_type": 0, "piece": piece_index})
         # 发送扩展消息，ut_metadata_id是远端peer告知的ID，payload是请求内容
         await self.send_message(MessageType.EXTENSION, bytes([self.ut_metadata_id]) + payload)
-        # print(f"Requested metadata piece {piece_index} from {self.host}:{self.port}")
+        logger.debug(f"Requested metadata piece {piece_index} from {self.host}:{self.port}")
 
     async def handle_message(self, msg_id: int, payload: bytes) -> None:
         """
@@ -321,16 +316,12 @@ class WirePeerClient:
         Handles messages received from the remote peer.
         """
         if msg_id == MessageType.CHOKE:
-            # 收到Choke消息，标记为被阻塞
+            logger.debug(f"Received CHOKE from {self.host}:{self.port}")
             self.unchoke_recv = False
-            # print(f"Received CHOKE from {self.host}:{self.port}")
         elif msg_id == MessageType.UNCHOKE:
-            # 收到Unchoke消息，标记为解除阻塞
+            logger.debug(f"Received UNCHOKE from {self.host}:{self.port}")
             self.unchoke_recv = True
-            # print(f"Received UNCHOKE from {self.host}:{self.port}")
-            # 解除阻塞后，可以开始请求元数据块
             if self.metadata_total_pieces > 0 and len(self.metadata_downloaded_pieces) < self.metadata_total_pieces:
-                # 优先请求第一个未下载的块
                 for i in range(self.metadata_total_pieces):
                     if i not in self.metadata_downloaded_pieces:
                         await self.request_metadata_piece(i)
@@ -354,76 +345,66 @@ class WirePeerClient:
                         self.metadata_total_pieces = math.ceil(self.metadata_size_val / MAX_SIZE)
                         # 初始化元数据字节数组列表
                         self.metadata_data_list = [b""] * self.metadata_total_pieces
-                        # print(f"Ext handshake from {self.host}:{self.port}. ut_metadata_id: {self.ut_metadata_id}, metadata_size: {self.metadata_size_val}, total_pieces: {self.metadata_total_pieces}")
-                        # 发送Interested消息
+                        logger.debug(f"Ext handshake from {self.host}:{self.port}. ut_metadata_id: {self.ut_metadata_id}, metadata_size: {self.metadata_size_val}, total_pieces: {self.metadata_total_pieces}")
                         await self.send_interested()
                     else:
-                        # print(f"Peer {self.host}:{self.port} does not support metadata exchange or metadata_size is invalid.")
-                        await self.close() # 不支持元数据交换则关闭连接
+                        logger.warning(f"Peer {self.host}:{self.port} does not support metadata exchange (ut_metadata_id: {self.ut_metadata_id}) or metadata_size is invalid ({self.metadata_size_val}). Closing.")
+                        await self.close()
                 except Exception as e:
-                    # print(f"Error decoding extension handshake from {self.host}:{self.port}: {e}")
+                    logger.error(f"Error decoding extension handshake from {self.host}:{self.port}: {e}", exc_info=True)
                     await self.close()
             elif ext_msg_id == self.ut_metadata_id and self.ut_metadata_id > 0 : # 元数据块响应，且我们知道ut_metadata_id
-                # 处理元数据块响应
                 try:
-                    # 尝试解码头部信息，找到piece索引
-                    # 正确的格式是 bencoded_dict + piece_data
-                    # 例如: d8:msg_typei1e5:piecei0ee<raw_piece_data>
-                    # 我们需要找到 'ee' 的位置来分离字典和原始数据
                     metadata_piece_offset = ext_payload_raw.find(b"ee") + 2
-                    if metadata_piece_offset <= 1 : # "ee" not found or at the beginning, means invalid format
-                         raise ValueError("Invalid metadata piece format: 'ee' not found or at beginning.")
+                    if metadata_piece_offset <= 1 :
+                         logger.warning(f"Invalid metadata piece format from {self.host}:{self.port}: 'ee' not found or at beginning.")
+                         await self.close()
+                         return
 
                     decoded_header = bencoder.decode(ext_payload_raw[:metadata_piece_offset])
                     piece_index = decoded_header.get(b"piece", -1)
-                    # 实际的元数据块内容
                     actual_metadata_block = ext_payload_raw[metadata_piece_offset:]
 
-                    expected_size = MAX_SIZE
-                    if piece_index == self.metadata_total_pieces -1: # 最后一块
-                        expected_size = self.metadata_size_val - (MAX_SIZE * piece_index)
-
-                    if len(actual_metadata_block) != expected_size:
-                        # print(f"Metadata piece {piece_index} size mismatch. Expected {expected_size}, got {len(actual_metadata_block)}")
-                        # 块大小不匹配，可能丢弃或关闭连接
-                        # 可以选择重置该块的下载状态并重新请求，或者直接关闭
+                    if not (0 <= piece_index < self.metadata_total_pieces):
+                        logger.warning(f"Invalid piece index {piece_index} from {self.host}:{self.port}. Total pieces: {self.metadata_total_pieces}. Closing.")
                         await self.close()
                         return
 
-                    if piece_index >= 0 and piece_index < self.metadata_total_pieces:
-                        if piece_index not in self.metadata_downloaded_pieces: # 避免重复处理
-                            self.metadata_data_list[piece_index] = actual_metadata_block
-                            self.metadata_downloaded_pieces.add(piece_index)
-                            # print(f"Received metadata piece {piece_index} from {self.host}:{self.port}. Downloaded {len(self.metadata_downloaded_pieces)}/{self.metadata_total_pieces}")
+                    expected_size = MAX_SIZE
+                    if piece_index == self.metadata_total_pieces -1:
+                        expected_size = self.metadata_size_val - (MAX_SIZE * piece_index)
+
+                    if len(actual_metadata_block) != expected_size:
+                        logger.warning(f"Metadata piece {piece_index} size mismatch for {self.host}:{self.port}. Expected {expected_size}, got {len(actual_metadata_block)}. Closing.")
+                        await self.close()
+                        return
+
+                    if piece_index not in self.metadata_downloaded_pieces:
+                        self.metadata_data_list[piece_index] = actual_metadata_block
+                        self.metadata_downloaded_pieces.add(piece_index)
+                        logger.debug(f"Received metadata piece {piece_index} from {self.host}:{self.port}. Downloaded {len(self.metadata_downloaded_pieces)}/{self.metadata_total_pieces}")
 
                         if len(self.metadata_downloaded_pieces) == self.metadata_total_pieces:
-                            # 所有元数据块下载完成
                             full_metadata = b"".join(self.metadata_data_list)
-                            # 校验元数据的SHA1哈希值是否与info_hash匹配
                             if hashlib.sha1(full_metadata).digest() == self.info_hash:
-                                # print(f"Metadata for {binascii.hexlify(self.info_hash).decode()} successfully downloaded from {self.host}:{self.port}")
-                                # 调用回调函数处理完整的元数据
+                                logger.info(f"Metadata for {binascii.hexlify(self.info_hash).decode()} successfully downloaded from {self.host}:{self.port}")
                                 if self.on_metadata_complete_cb:
                                     self.on_metadata_complete_cb(full_metadata)
-                                await self.close() # 下载完成，关闭连接
+                                await self.close()
                             else:
-                                # print(f"Metadata hash mismatch for {binascii.hexlify(self.info_hash).decode()} from {self.host}:{self.port}. Corrupted data.")
-                                # 清空已下载记录，可以尝试重新请求，或者放弃该peer
-                                self.metadata_downloaded_pieces.clear()
+                                logger.warning(f"Metadata hash mismatch for {binascii.hexlify(self.info_hash).decode()} from {self.host}:{self.port}. Corrupted data. Closing.")
+                                self.metadata_downloaded_pieces.clear() # Allow retry if connection is re-established by chance
                                 self.metadata_data_list = [b""] * self.metadata_total_pieces
-                                await self.close() # 出错则关闭
-                        elif self.unchoke_recv: # 如果仍然是unchoke状态，请求下一个块
-                            # 请求下一个未下载的元数据块
+                                await self.close()
+                        elif self.unchoke_recv:
                             for i in range(self.metadata_total_pieces):
                                 if i not in self.metadata_downloaded_pieces:
                                     await self.request_metadata_piece(i)
-                                    break # 一次只请求一个，等待响应
+                                    break
                     else:
-                        # print(f"Invalid piece index {piece_index} from {self.host}:{self.port}")
-                        await self.close() # 无效索引，关闭连接
+                        logger.debug(f"Already have piece {piece_index} from {self.host}:{self.port}, ignoring.")
                 except Exception as e:
-                    # print(f"Error processing metadata piece from {self.host}:{self.port}: {e}")
-                    # 发生错误，可以考虑关闭连接或重试
+                    logger.error(f"Error processing metadata piece from {self.host}:{self.port}: {e}", exc_info=True)
                     await self.close()
         # 可以根据需要处理其他消息类型，如HAVE, BITFIELD, REQUEST, PIECE, CANCEL, PORT等
 
@@ -435,22 +416,33 @@ class WirePeerClient:
         if self.closing:
             return
         self.closing = True
+        logger.debug(f"Closing connection with {self.host}:{self.port} (closing flag: {self.closing})")
+        if self.closing:
+            return
+        self.closing = True
         if self.writer:
             self.writer.close()
             try:
-                # 等待socket关闭完成
                 await self.writer.wait_closed()
-            except Exception:
-                # 忽略关闭过程中可能发生的错误
-                pass
-        # print(f"Connection with {self.host}:{self.port} closed.")
-        # 清理队列，防止其他协程阻塞
-        while not self.queue.empty():
+            except (ConnectionResetError, BrokenPipeError, OSError, AttributeError) as e:
+                logger.debug(f"Error during writer.wait_closed() for {self.host}:{self.port}: {e}")
+            except Exception as e:
+                logger.warning(f"Unexpected error during writer.wait_closed() for {self.host}:{self.port}: {e}", exc_info=True)
+
+        self.writer = None
+        self.reader = None
+        logger.debug(f"Connection with {self.host}:{self.port} streams closed.")
+
+        while True:
             try:
                 self.queue.get_nowait()
                 self.queue.task_done()
             except asyncio.QueueEmpty:
                 break
+            except Exception as e:
+                logger.warning(f"Unexpected error clearing queue for {self.host}:{self.port}: {e}", exc_info=True)
+                break
+        logger.debug(f"Message queue cleared for {self.host}:{self.port}.")
 
 
     async def start(self) -> None:
@@ -460,22 +452,22 @@ class WirePeerClient:
         Starts communication with the peer, including handshake, extended handshake, and message loop.
         If metadata is successfully fetched, the on_metadata_complete_cb callback is called.
         """
+        logger.debug(f"Starting client for {self.host}:{self.port} with info_hash {binascii.hexlify(self.info_hash).decode()}")
         if not await self.do_handshake():
-            # print(f"Failed to handshake with {self.host}:{self.port}, closing connection.")
-            await self.close()
+            logger.info(f"Failed to handshake with {self.host}:{self.port}, closing connection.")
+            # close() is called within do_handshake on failure.
             return
 
-        # 发送扩展握手消息
         await self.send_ext_handshake()
 
-        # 消息处理循环
-        # 设置一个整体的超时，例如120秒，如果120秒内没有完成元数据下载就放弃
         try:
-            await asyncio.wait_for(self._message_loop(), timeout=120)
+            await asyncio.wait_for(self._message_loop(), timeout=60)
         except asyncio.TimeoutError:
-            # print(f"Overall timeout for metadata exchange with {self.host}:{self.port}.")
-            pass
+            logger.info(f"Overall timeout for metadata exchange with {self.host}:{self.port}.")
+        except Exception as e:
+            logger.error(f"Unexpected error in message loop for {self.host}:{self.port}: {e}", exc_info=True)
         finally:
+            logger.debug(f"Client for {self.host}:{self.port} start() method finishing, ensuring close.")
             await self.close()
 
     async def _message_loop(self):
@@ -489,39 +481,35 @@ class WirePeerClient:
                 break
             try:
                 # 从队列中获取消息，设置超时以避免永久阻塞
-                msg_id, payload = await asyncio.wait_for(self.queue.get(), timeout=30) # 增加超时到30秒
+                msg_id, payload = await asyncio.wait_for(self.queue.get(), timeout=30)
                 await self.handle_message(msg_id, payload)
                 self.queue.task_done()
             except asyncio.TimeoutError:
-                # 长时间未收到消息
-                if self.handshake_recv and not self.closing :
-                    if self.ext_handshake_send and not self.ext_handshake_recv and self.metadata_total_pieces == 0 :
-                        # 已发送扩展握手，但长时间未收到响应，可能对方不支持或网络问题
-                        # print(f"Timeout waiting for extension handshake response from {self.host}:{self.port}, closing.")
-                        await self.close() # 关闭连接
-                        break
-                    elif self.interested_send and not self.unchoke_recv and self.metadata_total_pieces > 0 :
-                        # 已发送interested，但长时间未收到unchoke
-                        # print(f"Timeout waiting for UNCHOKE from {self.host}:{self.port} after sending INTERESTED, closing.")
-                        await self.close()
-                        break
-                    elif len(self.metadata_downloaded_pieces) > 0 and len(self.metadata_downloaded_pieces) < self.metadata_total_pieces:
-                        # 正在下载中，但某个块超时了
-                        # print(f"Timeout waiting for metadata piece from {self.host}:{self.port}, closing.")
-                        await self.close()
-                        break
-                    else: # 其他情况，发送keep-alive
-                        # print(f"Timeout waiting for message from {self.host}:{self.port}, sending keep-alive.")
-                        await self.send_message(MessageType.KEEP_ALIVE)
-
-                elif not self.handshake_recv: #如果连握手都没完成就超时了，说明对方无响应
-                    # print(f"Timeout waiting for initial messages from {self.host}:{self.port}, closing.")
-                    await self.close()
+                if self.closing: # If already closing, just break
+                    logger.debug(f"Message loop for {self.host}:{self.port} timed out but already closing.")
                     break
+
+                logger.debug(f"Timeout waiting for message from queue for {self.host}:{self.port}.")
+                if self.handshake_recv:
+                    if self.ext_handshake_send and not self.ext_handshake_recv and self.metadata_total_pieces == 0:
+                        logger.warning(f"Timeout waiting for extension handshake response from {self.host}:{self.port}, closing.")
+                        await self.close()
+                    elif self.interested_send and not self.unchoke_recv and self.metadata_total_pieces > 0:
+                        logger.warning(f"Timeout waiting for UNCHOKE from {self.host}:{self.port} after sending INTERESTED, closing.")
+                        await self.close()
+                    elif self.metadata_total_pieces > 0 and len(self.metadata_downloaded_pieces) < self.metadata_total_pieces:
+                        logger.warning(f"Timeout waiting for metadata piece from {self.host}:{self.port}, closing.")
+                        await self.close()
+                    else:
+                        logger.debug(f"Sending keep-alive to {self.host}:{self.port}.")
+                        await self.send_message(MessageType.KEEP_ALIVE)
+                elif not self.handshake_recv:
+                    logger.warning(f"Timeout waiting for initial messages (pre-handshake) from {self.host}:{self.port}, closing.")
+                    await self.close()
             except Exception as e:
-                # print(f"Error in message loop for {self.host}:{self.port}: {e}")
-                await self.close()
-                break
+                logger.error(f"Error in message loop for {self.host}:{self.port}: {e}", exc_info=True)
+                await self.close() # Ensure close on unexpected error in loop
+                break # Exit loop on error
 
 async def get_metadata(info_hash: bytes, my_id: bytes, host: str, port: int, loop) -> bytes | None:
     """
@@ -544,12 +532,11 @@ async def get_metadata(info_hash: bytes, my_id: bytes, host: str, port: int, loo
     try:
         await client.start()
     except Exception as e:
-        # print(f"Exception during get_metadata with {host}:{port} - {e}")
-        # 确保在任何异常情况下都关闭客户端
-        await client.close()
-    finally:
-        # 再次确保关闭，即使start内部的关闭逻辑由于某些原因未执行
-        if not client.closing:
+        logger.error(f"Exception during get_metadata call for {host}:{port} with info_hash {binascii.hexlify(info_hash).decode()}: {e}", exc_info=True)
+        # client.start() has its own finally block that calls close.
+        # If the error occurs before or after client.start() itself, we ensure close here.
+        if not client.closing: # Ensure close is only called if not already initiated
             await client.close()
-
+    # No explicit finally client.close() here, as client.start() handles its own closure.
+    # The above try/except is more for errors outside the client.start() main try/finally.
     return metadata_container[0]

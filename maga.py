@@ -2,6 +2,7 @@ import asyncio
 import binascii
 import os
 import signal
+import logging # Ensure logging is imported for later use if needed
 # 导入wire_protocol中的get_metadata函数，用于获取torrent元数据
 from wire_protocol import get_metadata
 
@@ -50,8 +51,8 @@ BOOTSTRAP_NODES = (
 # 它通过加入DHT网络，监听其他节点发送的get_peers和announce_peer请求，
 # 从而发现infohash和对应的peer地址。
 # 新版本集成了wire_protocol.py中的功能，使其能够主动连接peer并尝试下载元数据。
-class Maga(asyncio.DatagramProtocol):
-    def __init__(self, loop=None, bootstrap_nodes=BOOTSTRAP_NODES, interval=1):
+class Maga(asyncio.DgramProtocol):
+    def __init__(self, loop=None, bootstrap_nodes=BOOTSTRAP_NODES, interval=1, max_concurrent_metadata_fetches=20): # Added max_concurrent_metadata_fetches
         # 生成当前节点的ID
         self.node_id = random_node_id()
         self.transport = None
@@ -62,6 +63,9 @@ class Maga(asyncio.DatagramProtocol):
         self.bootstrap_nodes = bootstrap_nodes # DHT引导节点列表
         self.__running = False # 运行状态标志
         self.interval = interval # 自动查找节点的间隔时间
+        # Initialize the semaphore
+        self.metadata_semaphore = asyncio.Semaphore(max_concurrent_metadata_fetches)
+        logging.info(f"Maga (log): Initialized with max_concurrent_metadata_fetches={max_concurrent_metadata_fetches}")
 
     def stop(self):
         # 停止DHT爬虫的运行
@@ -160,7 +164,31 @@ class Maga(asyncio.DatagramProtocol):
         args = msg.get(b"r", {}) # "r"字段包含响应数据
         if b"nodes" in args: # 如果响应中包含"nodes"信息
             for node_id, ip, port in split_nodes(args[b"nodes"]): # 解析节点信息
-                self.ping(addr=(ip, port)) # ping这些新发现的节点
+                # Only ping if the node is not one of our bootstrap nodes
+                node_addr = (ip, port)
+                # self.bootstrap_nodes is a list of (host, port) tuples.
+                # Some hosts might be domain names. We should compare resolved IPs if possible,
+                # but for simplicity in this context, we'll compare directly if the bootstrap_nodes
+                # were defined with IPs, or rely on direct tuple comparison.
+                # A more robust check would involve resolving bootstrap hostnames to IPs once
+                # and storing them for comparison, but that's beyond this minor optimization.
+                # For now, we assume bootstrap_nodes contains tuples that can be directly compared
+                # or that exact string matches for hostnames are sufficient if they were used.
+                is_bootstrap_node = False
+                for bn_host, bn_port in self.bootstrap_nodes:
+                    if bn_port == port:
+                        # If ports match, we need to check hosts.
+                        # This simple check won't resolve bn_host if it's a hostname.
+                        # A proper implementation would resolve hostnames in bootstrap_nodes at init.
+                        if bn_host == ip:
+                            is_bootstrap_node = True
+                            break
+
+                if not is_bootstrap_node:
+                    self.ping(addr=node_addr) # ping这些新发现的节点
+                else:
+                    logging.debug(f"Maga (log): Skipping ping for bootstrap node {node_addr} received in find_node response.")
+
 
     async def handle_query(self, msg, addr):
         # 处理DHT网络中的查询(query)消息。
@@ -312,28 +340,36 @@ class Maga(asyncio.DatagramProtocol):
         # print(f"Announce_peer: infohash {infohash} from DHT node {dht_node_addr} for peer {peer_actual_addr}")
         await self.handler(infohash, dht_node_addr, peer_actual_addr)
 
-import logging # Ensure logging is imported
-
     async def handler(self, infohash: str, dht_node_addr: tuple, peer_addr: tuple):
         # 新的处理程序，负责调用get_metadata来获取元数据。
         # infohash: 目标种子的infohash (十六进制字符串)
         # dht_node_addr: 提供peer信息的DHT节点的地址 (ip, port)
         # peer_addr: 实际peer的地址 (ip, port)
-        logging.info(f"Handler (log): Attempting to get metadata for {infohash} from peer {peer_addr} (discovered via {dht_node_addr})")
-        try:
-            logging.getLogger().handlers[0].flush() # FLUSH LOGS
-        except:
-            pass # Ignore if no handlers or other issue
-        # 将十六进制的infohash转回字节串给get_metadata
-        try:
-            infohash_bytes = binascii.unhexlify(infohash)
-        except binascii.Error as e:
-            logging.warning(f"Handler (log): Invalid infohash format for {infohash}: {e}")
-            return
 
-        metadata = await get_metadata(infohash_bytes, peer_addr[0], peer_addr[1], loop=self.loop)
-        # 将获取到的元数据（或None）传递给子类实现的处理方法
-        await self.process_metadata_result(metadata, infohash, peer_addr)
+        # Acquire the semaphore before attempting to get metadata
+        async with self.metadata_semaphore:
+            logging.info(f"Handler (log): Acquired semaphore. Attempting to get metadata for {infohash} from peer {peer_addr} (discovered via {dht_node_addr})")
+            try:
+                logging.getLogger().handlers[0].flush() # FLUSH LOGS
+            except:
+                pass # Ignore if no handlers or other issue
+            # 将十六进制的infohash转回字节串给get_metadata
+            try:
+                infohash_bytes = binascii.unhexlify(infohash)
+            except binascii.Error as e:
+                logging.warning(f"Handler (log): Invalid infohash format for {infohash}: {e}")
+                return
+
+            try:
+                # Pass our node_id as my_id to get_metadata
+                metadata = await get_metadata(infohash_bytes, self.node_id, peer_addr[0], peer_addr[1], loop=self.loop)
+                # 将获取到的元数据（或None）传递给子类实现的处理方法
+                await self.process_metadata_result(metadata, infohash, peer_addr)
+            except Exception as e:
+                logging.error(f"Handler (log): Exception during get_metadata or process_metadata_result for {infohash} from {peer_addr}: {e}", exc_info=True)
+            # Semaphore is released automatically by 'async with'
+            logging.debug(f"Handler (log): Released semaphore for {infohash} from {peer_addr}")
+
 
     async def process_metadata_result(self, metadata: bytes | None, infohash: str, peer_addr: tuple):
         # 这是一个占位符方法 (或可视为抽象方法)，期望子类覆盖此方法来处理获取到的元数据。

@@ -46,7 +46,10 @@ class Maga(asyncio.DatagramProtocol):
     def __init__(self, loop=None, bootstrap_nodes=BOOTSTRAP_NODES, interval=1):
         self.node_id = random_node_id()
         self.transport = None
-        self.loop = loop or asyncio.get_event_loop()
+        if loop is None:
+            self.loop = asyncio.new_event_loop()
+        else:
+            self.loop = loop
         self.bootstrap_nodes = bootstrap_nodes
         self.__running = False
         self.interval = interval
@@ -66,6 +69,7 @@ class Maga(asyncio.DatagramProtocol):
         coro = self.loop.create_datagram_endpoint(
                 lambda: self, local_addr=('0.0.0.0', port)
         )
+        asyncio.set_event_loop(self.loop)
         transport, _ = self.loop.run_until_complete(coro)
 
         for signame in ('SIGINT', 'SIGTERM'):
@@ -79,7 +83,7 @@ class Maga(asyncio.DatagramProtocol):
             # Bootstrap
             self.find_node(addr=node, node_id=self.node_id)
 
-        asyncio.ensure_future(self.auto_find_nodes(), loop=self.loop)
+        self.loop.create_task(self.auto_find_nodes())
         self.loop.run_forever()
         self.loop.close()
 
@@ -108,8 +112,8 @@ class Maga(asyncio.DatagramProtocol):
             return self.handle_response(msg, addr=addr)
 
         if msg_type == b'q':
-            return asyncio.ensure_future(
-                self.handle_query(msg, addr=addr), loop=self.loop
+            return self.loop.create_task(
+                self.handle_query(msg, addr=addr)
             )
 
     def handle_response(self, msg, addr):

@@ -420,7 +420,7 @@ async def get_metadata(info_hash: bytes, my_id: bytes, host: str, port: int, loo
 # 它通过加入DHT网络，监听其他节点发送的get_peers和announce_peer请求，
 # 从而发现infohash和对应的peer地址。
 # 新版本集成了wire_protocol.py中的功能，使其能够主动连接peer并尝试下载元数据。
-class Maga(asyncio.DgramProtocol):
+class Maga(asyncio.DatagramProtocol):
     def __init__(self, loop=None, bootstrap_nodes=BOOTSTRAP_NODES, interval=1, max_concurrent_metadata_fetches=20): # 添加了 max_concurrent_metadata_fetches
         # 生成当前节点的ID
         self.node_id = random_node_id()

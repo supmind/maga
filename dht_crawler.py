@@ -35,15 +35,11 @@ BOOTSTRAP_NODES = ( # 引导节点
 BT_PROTOCOL = b"BitTorrent protocol"
 # BitTorrent协议标识符的长度
 BT_PROTOCOL_LEN = len(BT_PROTOCOL)
-# 扩展协议ID，用于支持扩展消息
-EXT_ID = 0
-# 扩展握手消息ID
-EXT_HANDSHAKE_ID = 0
-# 扩展握手消息内容，通常包含客户端版本等信息
+# 扩展握手消息ID (BEP0004)
+EXT_HANDSHAKE_ID = 0 # ID for extended handshake message itself
+# 扩展握手消息内容，通常包含客户端版本等信息 (BEP0004)
 EXT_HANDSHAKE_MESSAGE = {"m": {"ut_metadata": 1}, "v": "python-bittorrent-v0.1"}
-# 数据块常量，此处保留原文含义
-BLOCK = 1
-# 最大数据块大小，通常为16KB (2^14 bytes)
+# 最大数据块大小，通常为16KB (2^14 bytes) (BEP0009)
 MAX_SIZE = 2 ** 14
 # BitTorrent协议头部信息，用于构建握手消息
 BT_HEADER = b"\x13BitTorrent protocol\x00\x00\x00\x00\x00\x10\x00\x01"
@@ -168,7 +164,7 @@ class WirePeerClient:
                 logger.debug(f"从 {self.host}:{self.port} 收到消息类型 {msg_id}，负载长度 {len(payload)}")
                 await self.queue.put((msg_id, payload))
             except (ConnectionResetError, ConnectionRefusedError, asyncio.exceptions.IncompleteReadError, asyncio.TimeoutError, OSError) as e:
-                logger.warning(f"从 {self.host}:{self.port} 读取消息时出错: {e}")
+                logger.warning(f"从 {self.host}:{self.port} 读取消息时出错: {e}", exc_info=True)
                 await self.close()
                 break
             except Exception as e:
@@ -193,7 +189,7 @@ class WirePeerClient:
                 if data: self.writer.write(data)
                 await self.writer.drain()
         except (ConnectionResetError, ConnectionRefusedError, asyncio.TimeoutError, OSError, AttributeError) as e:
-            logger.warning(f"向 {self.host}:{self.port} 发送消息时出错: {e}")
+            logger.warning(f"向 {self.host}:{self.port} 发送消息时出错: {e}", exc_info=True)
             await self.close()
         except Exception as e:
             logger.error(f"向 {self.host}:{self.port} 发送消息时发生未知错误: {e}", exc_info=True)
@@ -208,7 +204,7 @@ class WirePeerClient:
             asyncio.ensure_future(self.read_messages(), loop=self.loop)
             return True
         except (ConnectionRefusedError, OSError, asyncio.TimeoutError) as e:
-            logger.warning(f"连接到 {self.host}:{self.port} 失败: {e}")
+            logger.warning(f"连接到 {self.host}:{self.port} 失败: {e}", exc_info=True)
             return False
         except Exception as e:
             logger.error(f"连接到 {self.host}:{self.port} 失败: {e}", exc_info=True)
@@ -223,7 +219,7 @@ class WirePeerClient:
         try:
             data = await asyncio.wait_for(self.reader.readexactly(BT_PROTOCOL_LEN + 1 + 8 + 20 + 20), timeout=10)
         except (asyncio.exceptions.IncompleteReadError, asyncio.TimeoutError, ConnectionResetError) as e:
-            logger.warning(f"与 {self.host}:{self.port} 的握手在读取期间失败: {e}")
+            logger.warning(f"与 {self.host}:{self.port} 的握手在读取期间失败: {e}", exc_info=True)
             await self.close(); return False
         except Exception as e:
             logger.error(f"与 {self.host}:{self.port} 的握手在读取期间发生未知错误: {e}", exc_info=True)
@@ -306,9 +302,6 @@ class WirePeerClient:
                         logger.warning(f"来自 {self.host}:{self.port} 的元数据块格式无效：未找到 'ee' 分隔符。正在关闭。")
                         await self.close()
                         return
-                    # if metadata_piece_offset <= 1:
-                    #      logger.warning(f"来自 {self.host}:{self.port} 的元数据块格式无效：未找到 'ee' 或其位置不正确。")
-                    #      await self.close(); return
                     decoded_header = bencoder.decode(ext_payload_raw[:metadata_piece_offset])
                     piece_index = decoded_header.get(b"piece", -1)
                     actual_metadata_block = ext_payload_raw[metadata_piece_offset:]
@@ -450,7 +443,7 @@ class Maga(asyncio.DatagramProtocol):
         # 初始化信号量
         self.metadata_semaphore = asyncio.Semaphore(max_concurrent_metadata_fetches)
         self.secret_salt = os.urandom(16) # Add this line in __init__
-        logger.info(f"Maga: 初始化完成，max_concurrent_metadata_fetches={max_concurrent_metadata_fetches}") # Removed (日志)
+        logger.info(f"Maga: 初始化完成，max_concurrent_metadata_fetches={max_concurrent_metadata_fetches}")
 
     def _generate_token(self, infohash_bytes: bytes, ip_address_str: str) -> bytes:
         # Helper method to generate a consistent token for get_peers/announce_peer
@@ -464,7 +457,13 @@ class Maga(asyncio.DatagramProtocol):
         # 停止DHT爬虫的运行
         logger.info(f"Maga: 正在停止 DHT 爬虫 (节点ID: {binascii.hexlify(self.node_id).decode()})...") # New INFO log
         self.__running = False # 设置运行状态为False
-        self.loop.call_later(self.interval, self.loop.stop) # 在指定间隔后停止事件循环
+        if self.transport:
+            logger.debug("Maga: Closing UDP transport.")
+            self.transport.close()
+            self.transport = None
+        # Schedule loop stop after a short delay to allow tasks to wind down
+        self.loop.call_later(self.interval if self.interval > 0 else 0.1, self.loop.stop)
+
 
     async def auto_find_nodes(self):
         # 自动周期性地向引导节点发送find_node请求，以发现更多节点并保持DHT网络的连接。
@@ -532,12 +531,12 @@ class Maga(asyncio.DatagramProtocol):
                 log_msg_summary += ", 包含响应数据"
             logger.debug(log_msg_summary)
         except Exception as e:
-            logger.warning(f"Maga: 从 {addr} 解码bencode数据失败: {e}") # Removed (日志)
+            logger.warning(f"Maga: 从 {addr} 解码bencode数据失败: {e}")
             return
         try:
             self.handle_message(msg, addr) # 处理解码后的消息
         except Exception as e:
-            logger.error(f"Maga: 处理来自 {addr} 的消息时出错: {e}", exc_info=True) # Removed (日志)
+            logger.error(f"Maga: 处理来自 {addr} 的消息时出错: {e}", exc_info=True)
             # 发生错误，向对方发送错误信息
             # msg["t"] 是交易ID，需要包含在响应中
             if msg and b"t" in msg: # 确保 msg 不为 None 且 't' 存在
@@ -546,7 +545,6 @@ class Maga(asyncio.DatagramProtocol):
                     b"y": b"e", # "e"表示错误类型
                     b"e": [202, b"Server Error"] # 错误码和错误信息, 确保字符串是字节串
                 }, addr=addr)
-            # raise e # 可以选择重新抛出异常用于调试
 
     def handle_message(self, msg, addr):
         # 处理解码后的DHT消息。
@@ -615,72 +613,72 @@ class Maga(asyncio.DatagramProtocol):
             logger.debug(f"  get_peers specific - Infohash: {proper_infohash(infohash) if infohash else 'N/A'}")
             if not infohash: return
             token = self._generate_token(infohash, addr[0]) # addr[0] is the IP string
-            infohash_hex = proper_infohash(infohash) # This line is still needed for handle_get_peers
+            infohash_hex = proper_infohash(infohash)
             self.send_message({
                 b"t": msg.get(b"t"),
                 b"y": b"r",
                 b"r": {
-                    b"id": self.fake_node_id(node_id),
-                    b"nodes": b"",
-                    b"token": token
+                    b"id": self.node_id, # Use own node_id
+                    b"nodes": b"",  # BEP0005: "nodes" or "values"
+                    b"token": token # BEP0005: must be returned for future announces
                 }
             }, addr=addr)
+            # This crawler fetches metadata directly instead of returning peers.
             await self.handle_get_peers(infohash_hex, addr)
         elif query_type == b"announce_peer":
             infohash = args.get(b"info_hash")
-            token = args.get(b"token")
+            token = args.get(b"token") # Renamed, was received_token
             port = args.get(b"port")
             implied_port = args.get(b"implied_port")
-            logger.debug(f"  announce_peer specific - Infohash: {proper_infohash(infohash) if infohash else 'N/A'}, Port: {port}, ImpliedPort: {implied_port}, Token: {binascii.hexlify(token).decode() if token else 'N/A'}")
-            infohash = args.get(b"info_hash")
-            if not infohash: return
-            token = self._generate_token(infohash, addr[0]) # addr[0] is the IP string
-            infohash_hex = proper_infohash(infohash) # This line is still needed for handle_get_peers
-            self.send_message({
-                b"t": msg.get(b"t"),
-                b"y": b"r",
-                b"r": {
-                    b"id": self.fake_node_id(node_id),
-                    b"nodes": b"",
-                    b"token": token
-                }
-            }, addr=addr)
-            await self.handle_get_peers(infohash_hex, addr)
-        elif query_type == b"announce_peer":
-            if not infohash: return # Already logged by general infohash log
 
-            # received_token is already logged by general token log
-            if not token: # Renamed from received_token for clarity within this scope
-                logger.debug(f"Maga: 从 {addr} 收到的 announce_peer 请求缺少token，已忽略。Infohash: {proper_infohash(infohash)}")
+            logger.debug(f"  announce_peer specific - Infohash: {proper_infohash(infohash) if infohash else 'N/A'}, Port: {port}, ImpliedPort: {implied_port}, Token: {binascii.hexlify(token).decode() if token else 'N/A'}")
+
+            if not infohash: # Check if infohash is present
+                logger.debug(f"Maga: From {addr} received announce_peer query without info_hash. Ignoring.")
+                return
+
+            # Token validation
+            if not token:
+                logger.debug(f"Maga: From {addr} received announce_peer query without token. Infohash: {proper_infohash(infohash)}. Ignoring.")
                 return
 
             expected_token = self._generate_token(infohash, addr[0])
 
             if token != expected_token:
-                logger.warning(f"Maga: 从 {addr} 收到的 announce_peer 请求token无效。收到: {binascii.hexlify(token).decode()}, 期望: {binascii.hexlify(expected_token).decode()}。Infohash: {proper_infohash(infohash)}")
+                logger.warning(f"Maga: From {addr} received announce_peer with invalid token. Received: {binascii.hexlify(token).decode()}, Expected: {binascii.hexlify(expected_token).decode()}. Infohash: {proper_infohash(infohash)}. Ignoring.")
                 return
 
-            # logger.debug(f"Maga: 从 {addr} 收到的 announce_peer 请求token有效。Infohash: {proper_infohash(infohash)}") # Optional
-            tid = msg.get(b"t")
-            self.send_message({
-                b"t": tid,
-                b"y": b"r",
-                b"r": {b"id": self.fake_node_id(node_id)}
-            }, addr=addr) # This send_message is a RESPONSE, not a query.
-            peer_ip = addr[0]
-            try:
-                # 'port' and 'implied_port' already logged by general args log
-                if args.get(b"implied_port", 0) == 1:
-                    peer_port = addr[1]
-                else:
-                    peer_port = args.get(b"port") # This was 'port' in the log
-                    if not peer_port or not (0 < peer_port < 65536):
-                        logger.debug(f"Maga: announce_peer from {addr} has invalid explicit port {peer_port}. Ignoring.")
-                        return
-            except KeyError:
-                logger.debug(f"Maga: announce_peer from {addr} missing port information. Ignoring.")
+            # Token is valid, proceed with announce
+            # logger.debug(f"Maga: Valid token received for announce_peer from {addr}. Infohash: {proper_infohash(infohash)}") # Optional
+
+            # Determine actual peer port
+            actual_peer_port = 0
+            if implied_port and implied_port.isdigit() and int(implied_port) == 1: # BEP specifies integer, bdecode might give bytes
+                 actual_peer_port = addr[1] # Use source port of the UDP packet
+            elif port and isinstance(port, int) and (0 < port < 65536): # Check if port is provided and valid
+                 actual_peer_port = port
+            else: # Try to interpret port if it's bytes (less common but good to check)
+                try:
+                    if port and isinstance(port, bytes) and port.isdigit():
+                        p_int = int(port)
+                        if 0 < p_int < 65536: actual_peer_port = p_int
+                except: pass # Ignore conversion errors
+
+            if actual_peer_port == 0:
+                logger.debug(f"Maga: From {addr} received announce_peer with invalid or missing port information. Port: {port}, ImpliedPort: {implied_port}. Infohash: {proper_infohash(infohash)}. Ignoring.")
                 return
-            peer_actual_addr = (peer_ip, peer_port)
+
+            peer_ip = addr[0]
+            peer_actual_addr = (peer_ip, actual_peer_port)
+
+            # Respond to the announce_peer query
+            self.send_message({
+                b"t": msg.get(b"t"), # Use the transaction ID from the query
+                b"y": b"r",
+                b"r": {b"id": self.node_id} # Respond with our own node ID
+            }, addr=addr)
+
+            # Process the announce: try to fetch metadata
             await self.handle_announce_peer(proper_infohash(infohash), addr, peer_actual_addr)
         elif query_type == b"find_node":
             target_node_id = args.get(b"target")
@@ -690,7 +688,7 @@ class Maga(asyncio.DatagramProtocol):
                 b"t": tid,
                 b"y": b"r",
                 b"r": {
-                    b"id": self.fake_node_id(node_id),
+                    b"id": self.node_id, # Use own node_id
                     b"nodes": b"" # Actual nodes would be added here in a full DHT impl.
                 }
             }, addr=addr)
@@ -699,7 +697,7 @@ class Maga(asyncio.DatagramProtocol):
             self.send_message({ # This send_message is a RESPONSE, not a query.
                 b"t": msg.get(b"t", b"pg"), # Use received TxID or default 'pg'
                 b"y": b"r",
-                b"r": {b"id": self.fake_node_id(node_id)}
+                b"r": {b"id": self.node_id} # Use own node_id
             }, addr=addr)
 
         # All queries should try to add the querying node to our routing table (or at least ping it)
@@ -717,7 +715,7 @@ class Maga(asyncio.DatagramProtocol):
             b"y": b"q",
             b"t": b"pg", # Transaction ID for ping
             b"q": b"ping",
-            b"a": {b"id": self.fake_node_id(node_id)}
+            b"a": {b"id": self.node_id} # Use own node_id
         }
         # Log for sending ping is now handled by send_message
         self.send_message(ping_msg, addr=addr)
@@ -728,9 +726,11 @@ class Maga(asyncio.DatagramProtocol):
 
     def connection_lost(self, exc):
         # 当连接丢失或关闭时由asyncio调用。
+        logger.info(f"Maga: UDP transport connection lost or closed. Exception: {exc}") # Log the exception
         self.__running = False
         if self.transport:
             self.transport.close()
+            self.transport = None # Set to None after closing
 
     def send_message(self, data, addr):
         # 发送bencoded编码的消息到指定地址。
@@ -763,14 +763,11 @@ class Maga(asyncio.DatagramProtocol):
         if self.transport:
             self.transport.sendto(bencoder.bencode(data), addr)
 
-    def fake_node_id(self, node_id=None):
-        # 生成一个伪装的节点ID。
-        if node_id and len(node_id) == 20:
-            return node_id[:-1]+self.node_id[-1:]
-        return self.node_id
-
-    def find_node(self, addr, node_id=None, target=None):
+    def find_node(self, addr, node_id=None, target=None): # node_id parameter is no longer used here for sender ID
         # 发送find_node请求到指定地址。
+        # The node_id parameter (typically the ID of addr) is not used for constructing our sender ID anymore.
+        # It might still be useful for other logic if find_node were to become more complex,
+        # but for now, it's not directly used in this simplified version.
         if not target:
             target = random_node_id() # Generate a random target if not specified
 
@@ -779,7 +776,7 @@ class Maga(asyncio.DatagramProtocol):
             b"y": b"q",
             b"q": b"find_node",
             b"a": {
-                b"id": self.fake_node_id(node_id), # Our ID (or faked)
+                b"id": self.node_id, # Our ID
                 b"target": target # ID we are looking for
             }
         }
@@ -788,18 +785,17 @@ class Maga(asyncio.DatagramProtocol):
 
     async def handle_get_peers(self, infohash, dht_node_addr):
         # 当从某个DHT节点收到get_peers请求时，dht_node_addr本身就是潜在的peer。
-        # print(f"收到Get_peers: infohash {infohash} 来自DHT节点 {dht_node_addr}")
         await self.handler(infohash, dht_node_addr, dht_node_addr)
 
     async def handle_announce_peer(self, infohash, dht_node_addr, peer_actual_addr):
         # 当从某个DHT节点收到announce_peer请求时，peer_actual_addr是实际声明拥有该infohash的peer的地址。
-        # print(f"收到Announce_peer: infohash {infohash} 来自DHT节点 {dht_node_addr}，实际peer地址 {peer_actual_addr}")
         await self.handler(infohash, dht_node_addr, peer_actual_addr)
 
     async def handler(self, infohash: str, dht_node_addr: tuple, peer_addr: tuple):
         # 新的处理程序，负责调用get_metadata来获取元数据。
+        # dht_node_addr is logged by caller (handle_query)
         async with self.metadata_semaphore: # 在尝试获取元数据前获取信号量
-            logger.debug(f"Handler: 已获取信号量。尝试从peer {peer_addr} (经由 {dht_node_addr} 发现) 获取 {infohash} 的元数据") # INFO -> DEBUG, Removed (日志)
+            logger.debug(f"Handler: 已获取信号量。尝试从peer {peer_addr} (经由 {dht_node_addr} 发现) 获取 {infohash} 的元数据") # INFO -> DEBUG
             try:
                 # 确保日志被刷新
                 if logger.handlers: logger.handlers[0].flush()
@@ -807,7 +803,7 @@ class Maga(asyncio.DatagramProtocol):
             try:
                 infohash_bytes = binascii.unhexlify(infohash) # 十六进制infohash转字节串
             except binascii.Error as e:
-                logger.warning(f"Handler: {infohash} 的infohash格式无效: {e}") # Removed (日志)
+                logger.warning(f"Handler: {infohash} 的infohash格式无效: {e}", exc_info=True)
                 return
 
             try:
@@ -815,16 +811,15 @@ class Maga(asyncio.DatagramProtocol):
                 metadata = await get_metadata(infohash_bytes, self.node_id, peer_addr[0], peer_addr[1], loop=self.loop)
                 await self.process_metadata_result(metadata, infohash, peer_addr) # 处理获取到的元数据
             except Exception as e:
-                logger.error(f"Handler: 从 {peer_addr} 获取 {infohash} 的元数据或处理结果时发生异常: {e}", exc_info=True) # Removed (日志)
+                logger.error(f"Handler: 从 {peer_addr} 获取 {infohash} 的元数据或处理结果时发生异常: {e}", exc_info=True)
             # 'async with' 会自动释放信号量
-            logger.debug(f"Handler: 已释放关于 {infohash} (来自 {peer_addr}) 的信号量") # Removed (日志)
+            logger.debug(f"Handler: 已释放关于 {infohash} (来自 {peer_addr}) 的信号量")
 
     async def process_metadata_result(self, metadata: bytes | None, infohash: str, peer_addr: tuple):
         # 这是一个占位符方法，期望子类覆盖此方法来处理获取到的元数据。
         # metadata: 获取到的元数据内容 (bytes)，如果失败则为None。
         # infohash: 相关的infohash (十六进制字符串)。
         # peer_addr: 提供元数据的peer的地址 (ip, port)。
-        # print(f"处理元数据结果: infohash={infohash}, peer={peer_addr}, 是否有元数据={metadata is not None}")
         pass # 子类应实现具体的处理逻辑
 
 # --- Crawler 类 (来自 example.py, 继承自Maga) ---
@@ -930,7 +925,7 @@ if __name__ == '__main__':
     # Maga基类的run方法会启动网络监听和DHT节点维护。
     # 当通过get_peers或announce_peer发现infohash，并尝试从peer获取元数据后，
     # Crawler中定义的process_metadata_result方法将被回调。
-    logger.info("dht_crawler: 初始化Crawler并开始运行...") # Removed (日志) and (原标准输出)
+    logger.info("dht_crawler: 初始化Crawler并开始运行...")
     try:
         # 尝试刷新日志处理器（如果存在）
         # 这在某些情况下有助于确保所有启动日志都已写出

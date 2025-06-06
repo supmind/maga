@@ -301,9 +301,13 @@ class WirePeerClient:
             elif ext_msg_id == self.ut_metadata_id and self.ut_metadata_id > 0:
                 try:
                     metadata_piece_offset = ext_payload_raw.find(b"ee") + 2
-                    if metadata_piece_offset <= 1:
-                         logger.warning(f"来自 {self.host}:{self.port} 的元数据块格式无效：未找到 'ee' 或其位置不正确。")
-                         await self.close(); return
+                    if metadata_piece_offset == 1: # This means b"ee" was not found (find returned -1)
+                        logger.warning(f"来自 {self.host}:{self.port} 的元数据块格式无效：未找到 'ee' 分隔符。正在关闭。")
+                        await self.close()
+                        return
+                    # if metadata_piece_offset <= 1:
+                    #      logger.warning(f"来自 {self.host}:{self.port} 的元数据块格式无效：未找到 'ee' 或其位置不正确。")
+                    #      await self.close(); return
                     decoded_header = bencoder.decode(ext_payload_raw[:metadata_piece_offset])
                     piece_index = decoded_header.get(b"piece", -1)
                     actual_metadata_block = ext_payload_raw[metadata_piece_offset:]
@@ -430,7 +434,16 @@ class Maga(asyncio.DgramProtocol):
         self.interval = interval # 自动查找节点的间隔时间
         # 初始化信号量
         self.metadata_semaphore = asyncio.Semaphore(max_concurrent_metadata_fetches)
+        self.secret_salt = os.urandom(16) # Add this line in __init__
         logger.info(f"Maga (日志): 初始化完成，max_concurrent_metadata_fetches={max_concurrent_metadata_fetches}")
+
+    def _generate_token(self, infohash_bytes: bytes, ip_address_str: str) -> bytes:
+        # Helper method to generate a consistent token for get_peers/announce_peer
+        h = hashlib.sha1()
+        h.update(infohash_bytes)
+        h.update(ip_address_str.encode('utf-8')) # Encode IP to bytes
+        h.update(self.secret_salt)
+        return h.digest()[:4] # Return the first 4 bytes of the hash as token
 
     def stop(self):
         # 停止DHT爬虫的运行
@@ -448,8 +461,7 @@ class Maga(asyncio.DgramProtocol):
     def run(self, port=6881):
         # 启动DHT爬虫，监听指定端口。
         # 这是程序的主入口点。
-        print(f"Maga (标准输出): 在端口 {port} 上启动DHT节点...") # PRINT STATEMENT
-        logger.info(f"Maga (日志): 在端口 {port} 上启动DHT节点...")
+        logger.info(f"Maga (日志): 在端口 {port} 上启动DHT节点... (原标准输出)")
         try:
             # 确保日志在启动时被刷新（如果处理程序存在）
             if logger.handlers: # 检查是否有处理器
@@ -557,8 +569,8 @@ class Maga(asyncio.DgramProtocol):
         if query_type == b"get_peers":
             infohash = args.get(b"info_hash")
             if not infohash: return
-            infohash_hex = proper_infohash(infohash)
-            token = infohash[:2]
+            token = self._generate_token(infohash, addr[0]) # addr[0] is the IP string
+            infohash_hex = proper_infohash(infohash) # This line is still needed for handle_get_peers
             self.send_message({
                 b"t": msg.get(b"t"),
                 b"y": b"r",
@@ -572,8 +584,26 @@ class Maga(asyncio.DgramProtocol):
         elif query_type == b"announce_peer":
             infohash = args.get(b"info_hash")
             if not infohash: return
-            # TODO: 在实际应用中，需要验证token (`args.get(b"token")`)
-            # 以确保announce_peer的合法性，防止DHT污染。
+
+            received_token = args.get(b"token")
+            if not received_token:
+                logger.debug(f"Maga (日志): 从 {addr} 收到的 announce_peer 请求缺少token，已忽略。Infohash: {proper_infohash(infohash)}")
+                return
+
+            expected_token = self._generate_token(infohash, addr[0])
+
+            if received_token != expected_token:
+                logger.warning(f"Maga (日志): 从 {addr} 收到的 announce_peer 请求token无效。收到: {binascii.hexlify(received_token).decode()}, 期望: {binascii.hexlify(expected_token).decode()}。Infohash: {proper_infohash(infohash)}")
+                # Optionally, send an error response
+                # self.send_message({
+                #     b"t": msg.get(b"t"),
+                #     b"y": b"e",
+                #     b"e": [203, b"Protocol Error, bad token"]
+                # }, addr=addr)
+                return
+
+            # logger.debug(f"Maga (日志): 从 {addr} 收到的 announce_peer 请求token有效。Infohash: {proper_infohash(infohash)}") # Optional: log successful token validation
+            # Token验证通过，继续处理announce_peer
             tid = msg.get(b"t")
             self.send_message({
                 b"t": tid,
@@ -795,7 +825,7 @@ if __name__ == '__main__':
     # Maga基类的run方法会启动网络监听和DHT节点维护。
     # 当通过get_peers或announce_peer发现infohash，并尝试从peer获取元数据后，
     # Crawler中定义的process_metadata_result方法将被回调。
-    print("dht_crawler (标准输出): 初始化Crawler并开始运行...") # 为控制台反馈保留此print语句
+    logger.info("dht_crawler (日志): 初始化Crawler并开始运行... (原标准输出)") # 为控制台反馈保留此print语句
     try:
         # 尝试刷新日志处理器（如果存在）
         # 这在某些情况下有助于确保所有启动日志都已写出

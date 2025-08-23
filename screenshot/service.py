@@ -9,7 +9,9 @@ import threading
 from concurrent.futures import Future
 
 class LibtorrentError(Exception):
-    pass
+    def __init__(self, error_code):
+        self.error_code = error_code
+        super().__init__(f"Libtorrent error: {error_code.message()}")
 
 # ==============================================================================
 # TorrentFileReader: A file-like object for reading from a torrent

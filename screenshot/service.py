@@ -105,7 +105,7 @@ class ScreenshotService:
         settings = {
             'listen_interfaces': '0.0.0.0:6881',
             'enable_dht': True,
-            'alert_mask': lt.alert_category.error,
+            'alert_mask': lt.alert_category.error | lt.alert_category.status | lt.alert_category.dht | lt.alert_category.peer | lt.alert_category.tracker,
             'dht_bootstrap_nodes': 'router.bittorrent.com:6881,dht.transmissionbt.com:6881,router.utorrent.com:6881'
         }
         self.ses = lt.session(settings)
@@ -184,9 +184,11 @@ class ScreenshotService:
                     alerts = self.ses.pop_alerts()
                     for alert in alerts:
                         # If the alert is an error, log it as such.
-                        # Otherwise, we don't log it, to keep the logs clean as requested.
+                        # Otherwise, log it as debug to avoid cluttering the logs.
                         if alert.category() & lt.alert_category.error:
                             self.log.error(f"Libtorrent Alert: {alert}")
+                        else:
+                            self.log.debug(f"Libtorrent Alert: {alert}")
 
                         # Handle specific alerts needed for logic
                         if isinstance(alert, lt.metadata_received_alert):

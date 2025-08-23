@@ -157,15 +157,15 @@ from .dht import DHTNode
 class Downloader:
     def __init__(self, loop=None, dht_port=6882, num_workers=10):
         self.loop = loop or asyncio.get_event_loop()
-        self.dht_node = DHTNode(loop=self.loop)
         self.dht_port = dht_port
+        self.dht_node = DHTNode(loop=self.loop, port=self.dht_port)
         self.download_queue = asyncio.Queue()
         self.num_workers = num_workers
         self.workers = []
         self._running = False
 
     async def run(self):
-        await self.dht_node.run(port=self.dht_port)
+        await self.dht_node.run()
         self._running = True
         for _ in range(self.num_workers):
             worker_task = self.loop.create_task(self._worker())

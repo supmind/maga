@@ -330,7 +330,7 @@ class ScreenshotService:
             # 3. Prioritize and download file header
             piece_size = ti.piece_length()
             # Let's download a bit more for the header to be safe with various video formats
-            header_size_to_download = 5 * 1024 * 1024
+            header_size_to_download = 1 * 1024 * 1024
             # Ensure we don't try to download more than the file size
             header_size_to_download = min(header_size_to_download, target_file.size)
 

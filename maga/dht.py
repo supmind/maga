@@ -159,8 +159,10 @@ class DHTNode(asyncio.DatagramProtocol):
         tid = msg.get(constants.KRPC_T)
 
         if tid in self.pending_pings:
-            self.log.debug(f"Received PING response from {addr}")
-            self.pending_pings[tid].set_result(True)
+            future = self.pending_pings.get(tid)
+            if future and not future.done():
+                self.log.debug(f"Received PING response from {addr}")
+                future.set_result(True)
             return
 
         if tid in self.pending_lookups:

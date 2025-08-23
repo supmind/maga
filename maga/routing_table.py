@@ -28,6 +28,7 @@ class KBucket:
         return next(iter(self.nodes.values()), None)
 
     def __contains__(self, node_id):
+        # When checking if a node_id is in a bucket, we must compare integers
         return self.min_id <= int.from_bytes(node_id, 'big') < self.max_id
 
     def __len__(self):
@@ -51,11 +52,23 @@ class RoutingTable:
         return None
 
     def add_node(self, node):
+        """
+        Adds a node to the routing table.
+
+        Returns:
+            A tuple of (status, data), where status is one of:
+            "NO_ACTION": Node is ourselves, nothing done.
+            "UPDATED": Node was already in a bucket and has been updated.
+            "ADDED": Node was successfully added to a bucket.
+            "SPLIT": A bucket was split. The caller should re-add the node.
+            "FULL": The bucket is full. Data contains the oldest node for a PING check.
+        """
         if node.node_id == self.node_id:
             return "NO_ACTION", None
 
         bucket = self.get_bucket_for_node(node.node_id)
         if bucket.get_node(node.node_id):
+            # Move to the end of the bucket to mark as most recently seen
             bucket.remove_node(node)
             bucket.add_node(node)
             return "UPDATED", None
@@ -64,13 +77,11 @@ class RoutingTable:
             bucket.add_node(node)
             return "ADDED", None
 
+        # Bucket is full, we must either split it or check if the oldest node is stale
         if self.node_id in bucket:
             self.split_bucket(bucket)
-            # The caller (DHTNode) is now responsible for re-adding the node
             return "SPLIT", None
         else:
-            # The bucket is full and we can't split it.
-            # Return the oldest node so the DHTNode can ping it.
             return "FULL", bucket.get_oldest_node()
 
     def remove_node(self, node):

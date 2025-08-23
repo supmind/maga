@@ -25,8 +25,7 @@ async def main():
     # Submit a few screenshot tasks to the service.
     # The user should replace these with real infohashes and desired timestamps.
     tasks_to_submit = [
-        # Big Buck Bunny - a known, well-seeded, web-optimized MP4 torrent
-        ("bbb6a578d5583a241484439b0ee576203104c615", "00:01:30"),
+
         # Sintel - another open-source movie torrent
         ("08ada5a7a6183aae1e09d831df6748d566095a10", "00:05:00")
     ]

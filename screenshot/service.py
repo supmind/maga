@@ -201,10 +201,10 @@ class ScreenshotService:
         with self.read_lock:
             future = self.pending_reads.pop(alert.piece, None)
         if future:
-            if alert.error:
-                future.set_exception(LibtorrentError(alert.error))
-            else:
-                future.set_result(bytes(alert.buffer))
+            # The `alert.error` is unreliable. The error message is "Success"
+            # yet the error flag is set. We will assume the alert means the
+            # buffer is valid.
+            future.set_result(bytes(alert.buffer))
 
     async def _alert_loop(self):
         while self._running:

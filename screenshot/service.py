@@ -59,36 +59,41 @@ class TorrentFileReader(io.RawIOBase):
 
         self.log.debug(f"Reading {size} bytes from position {self.pos}")
 
-        # 将文件级别的read请求，映射到torrent的piece级别
-        file_map = self.ti.map_file(self.file_index, self.pos, size)
-
         result_buffer = bytearray(size)
         buffer_offset = 0
+        bytes_to_go = size
+        current_file_pos = self.pos
 
-        for file_slice in file_map.file_slices:
-            piece_index = file_slice.piece_index
-            piece_offset = file_slice.start
-            slice_size = file_slice.size
+        piece_size = self.ti.piece_length()
 
-            data_to_read = min(slice_size, size - buffer_offset)
+        while bytes_to_go > 0:
+            # Map the current file position to a piece request.
+            # This gives us the piece index and the starting offset within that piece.
+            req = self.ti.map_file(self.file_index, current_file_pos, 1)
+            piece_index = req.piece
+            piece_offset = req.start
+
+            # Calculate how many bytes we can read from this specific piece,
+            # starting from the given offset.
+            bytes_available_in_piece = piece_size - piece_offset
+
+            # We only need to read what's left for our buffer, or what's left in the piece.
+            read_len = min(bytes_to_go, bytes_available_in_piece)
 
             if self.handle.have_piece(piece_index):
-                # 如果我们有这个piece，就去读取它
+                # If we have the piece, read the relevant chunk from it.
+                self.log.debug(f"Reading {read_len} bytes from piece {piece_index} at offset {piece_offset}")
                 piece_data = self.handle.read_piece(piece_index)
-
-                # 从piece中提取我们需要的部分
-                start = piece_offset
-                end = start + data_to_read
-                chunk = piece_data[start:end]
-
+                chunk = piece_data[piece_offset : piece_offset + read_len]
                 result_buffer[buffer_offset : buffer_offset + len(chunk)] = chunk
-                self.log.debug(f"Read {len(chunk)} bytes from downloaded piece {piece_index}")
             else:
-                # 如果没有这个piece，就用零字节填充
-                self.log.debug(f"Returning {data_to_read} zero bytes for missing piece {piece_index}")
-                # bytearray is already initialized to zeros, so we just skip
+                # If we don't have the piece, we return zero bytes as this is a sparse reader.
+                self.log.debug(f"Returning {read_len} zero bytes for missing piece {piece_index}")
+                # The bytearray is already zero-filled, so we just advance the pointers.
 
-            buffer_offset += data_to_read
+            buffer_offset += read_len
+            bytes_to_go -= read_len
+            current_file_pos += read_len
 
         self.pos += size
         return bytes(result_buffer)
@@ -289,8 +294,11 @@ class ScreenshotService:
             # Ensure we don't try to download more than the file size
             header_size_to_download = min(header_size_to_download, target_file.size)
 
-            file_map = ti.map_file(video_file_index, 0, header_size_to_download)
-            head_pieces = {p.piece for p in file_map.file_slices}
+            start_piece_req = ti.map_file(video_file_index, 0, 1)
+            # To get the end piece, we map the last byte of the range.
+            last_byte_offset = max(0, header_size_to_download - 1)
+            end_piece_req = ti.map_file(video_file_index, last_byte_offset, 1)
+            head_pieces = set(range(start_piece_req.piece, end_piece_req.piece + 1))
 
             if not head_pieces:
                 self.log.warning(f"No header pieces to download for {target_file.path}. The file might be empty.")
@@ -337,8 +345,10 @@ class ScreenshotService:
                 keyframe_pos = packet.pos
                 keyframe_size = packet.size
 
-                keyframe_map = ti.map_file(video_file_index, keyframe_pos, keyframe_size)
-                keyframe_pieces = {p.piece for p in keyframe_map.file_slices}
+                start_piece_req = ti.map_file(video_file_index, keyframe_pos, 1)
+                last_byte_offset = max(0, keyframe_pos + keyframe_size - 1)
+                end_piece_req = ti.map_file(video_file_index, last_byte_offset, 1)
+                keyframe_pieces = set(range(start_piece_req.piece, end_piece_req.piece + 1))
 
                 for p in keyframe_pieces:
                     handle.piece_priority(p, lt.download_priority.top_priority)

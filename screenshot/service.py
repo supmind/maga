@@ -126,14 +126,9 @@ class ScreenshotService:
             # Wait for the DHT to be ready before proceeding
             await self.dht_ready.wait()
 
-            infohash_bytes = binascii.unhexlify(infohash_hex)
-        except binascii.Error:
-            self.log.error(f"Invalid infohash format: {infohash_hex}")
-            return
-
-        try:
-            # 1. Add torrent and wait for metadata
+            # 1. Add torrent using a magnet link and wait for metadata
             future = self.loop.create_future()
+            infohash_bytes = binascii.unhexlify(infohash_hex)
             self.pending_metadata[str(infohash_bytes)] = future
 
             trackers = [
@@ -141,11 +136,11 @@ class ScreenshotService:
                 "udp://tracker.opentrackr.org:1337/announce",
                 "udp://tracker.coppersurfer.tk:6969/announce"
             ]
-            params = {
-                'info_hash': infohash_bytes,
-                'save_path': save_dir,
-                'trackers': trackers
-            }
+            tracker_str = "&".join([f"tr={t}" for t in trackers])
+            magnet_uri = f"magnet:?xt=urn:btih:{infohash_hex}&{tracker_str}"
+
+            params = lt.parse_magnet_uri(magnet_uri)
+            params.save_path = save_dir
             handle = self.ses.add_torrent(params)
 
             self.log.debug(f"Added torrent for {infohash_hex}, waiting for metadata...")

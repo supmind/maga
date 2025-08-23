@@ -149,7 +149,7 @@ class Maga(asyncio.DatagramProtocol):
             peer_addr = (addr[0], peer_port)
 
             asyncio.ensure_future(
-                self.handler(utils.proper_infohash(infohash), peer_addr),
+                self.handler(infohash, peer_addr),
                 loop=self.loop
             )
         elif query_type == constants.KRPC_FIND_NODE:

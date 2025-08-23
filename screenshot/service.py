@@ -183,8 +183,10 @@ class ScreenshotService:
                 if self.ses.wait_for_alert(1000):
                     alerts = self.ses.pop_alerts()
                     for alert in alerts:
-                        # Log all alerts at DEBUG level
-                        self.log.debug(f"Libtorrent Alert: {alert}")
+                        # If the alert is an error, log it as such.
+                        # Otherwise, we don't log it, to keep the logs clean as requested.
+                        if alert.category() & lt.alert_category.error:
+                            self.log.error(f"Libtorrent Alert: {alert}")
 
                         # Handle specific alerts needed for logic
                         if isinstance(alert, lt.metadata_received_alert):

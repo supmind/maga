@@ -229,15 +229,11 @@ class ScreenshotService:
         os.makedirs(save_dir, exist_ok=True)
 
         try:
-            # Wait for the DHT to be ready before proceeding
-            self.log.debug("Waiting for DHT to be ready...")
-            await self.dht_ready.wait()
-            self.log.debug("DHT is ready.")
-
-            # 1. Add torrent using a magnet link and wait for metadata
-            self.log.debug("Waiting for metadata...")
-            future = self.loop.create_future()
             infohash_bytes = binascii.unhexlify(infohash_hex)
+
+            # 1. Add torrent using a magnet link.
+            # This will trigger the DHT to start if it hasn't already.
+            future = self.loop.create_future()
             self.pending_metadata[str(infohash_bytes)] = future
 
             trackers = [
@@ -251,8 +247,15 @@ class ScreenshotService:
             params = lt.parse_magnet_uri(magnet_uri)
             params.save_path = save_dir
             handle = self.ses.add_torrent(params)
+            self.log.debug(f"Added torrent for {infohash_hex}.")
 
-            self.log.debug(f"Added torrent for {infohash_hex}, waiting for metadata...")
+            # Wait for the DHT to be ready before proceeding
+            self.log.debug("Waiting for DHT to be ready...")
+            await self.dht_ready.wait()
+            self.log.debug("DHT is ready.")
+
+            # Now wait for the metadata to be received
+            self.log.debug(f"Waiting for metadata...")
             await asyncio.wait_for(future, timeout=180) # Increased timeout
             self.log.info(f"Successfully received metadata for {infohash_hex}")
 

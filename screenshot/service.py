@@ -201,13 +201,13 @@ class ScreenshotService:
     def _handle_dht_bootstrap(self, alert):
         if not self.dht_ready.is_set():
             self.dht_ready.set()
-            self.log.info("DHT bootstrapped. Service is ready to process tasks.")
+            self.log.debug("DHT bootstrapped. Service is ready to process tasks.")
 
     def _handle_dht_get_peers_reply(self, alert):
-        self.log.info(f"Received DHT peers reply for {alert.info_hash}. Found {len(alert.peers)} peers.")
+        self.log.debug(f"Received DHT peers reply for {alert.info_hash}. Found {len(alert.peers)} peers.")
 
     def _handle_tracker_reply(self, alert):
-        self.log.info(f"Received tracker reply for {alert.handle.info_hash()}. Found {alert.num_peers} peers.")
+        self.log.debug(f"Received tracker reply for {alert.handle.info_hash()}. Found {alert.num_peers} peers.")
 
     def _handle_read_piece(self, alert):
         with self.read_lock:
@@ -308,7 +308,7 @@ class ScreenshotService:
             # Now wait for the metadata to be received
             self.log.debug(f"Waiting for metadata...")
             await asyncio.wait_for(future, timeout=180) # Increased timeout
-            self.log.info(f"Successfully received metadata for {infohash_hex}")
+            self.log.debug(f"Successfully received metadata for {infohash_hex}")
 
             # 2. Find target video file
             ti = handle.get_torrent_info()
@@ -325,7 +325,7 @@ class ScreenshotService:
                 self.log.warning(f"No video file found in torrent {infohash_hex}")
                 return
 
-            self.log.info(f"Identified target video file: {target_file.path} (size: {target_file.size})")
+            self.log.debug(f"Identified target video file: {target_file.path} (size: {target_file.size})")
 
             # 3. Prioritize and download file header
             piece_size = ti.piece_length()
@@ -347,11 +347,11 @@ class ScreenshotService:
             for p in head_pieces:
                 handle.piece_priority(p, 7)
 
-            self.log.info(f"Downloading header for {target_file.path} ({len(head_pieces)} pieces)...")
+            self.log.debug(f"Downloading header for {target_file.path} ({len(head_pieces)} pieces)...")
             self.log.debug("Waiting for header pieces...")
             await self._wait_for_pieces(infohash_hex, handle, head_pieces.copy())
             self.log.debug("Header pieces finished.")
-            self.log.info(f"Header for {target_file.path} downloaded.")
+            self.log.debug(f"Header for {target_file.path} downloaded.")
 
             # 4. Run the blocking PyAV operations in a separate thread
             await self.loop.run_in_executor(
@@ -392,7 +392,7 @@ class ScreenshotService:
             if not packet:
                 raise RuntimeError("Could not find a keyframe near the target timestamp.")
 
-            self.log.info(f"Found keyframe at {float(packet.pts * stream.time_base):.2f}s for target {timestamp}")
+            self.log.debug(f"Found keyframe at {float(packet.pts * stream.time_base):.2f}s for target {timestamp}")
 
             # 5. Prioritize and download pieces for the keyframe
             keyframe_pos = packet.pos
@@ -413,7 +413,7 @@ class ScreenshotService:
                 self.loop
             )
             future.result(timeout=180) # Block this thread waiting for the result
-            self.log.info("Keyframe data downloaded.")
+            self.log.debug("Keyframe data downloaded.")
 
             # 6. Take screenshot by re-seeking and decoding in the same container
             self.log.debug("Re-seeking to keyframe to decode...")

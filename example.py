@@ -10,8 +10,8 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-# 设置服务日志级别为 DEBUG，以输出更详细的信息
-logging.getLogger("ScreenshotService").setLevel(logging.DEBUG)
+# Set the service log level to INFO to reduce verbosity
+logging.getLogger("ScreenshotService").setLevel(logging.INFO)
 
 
 async def main():

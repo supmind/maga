@@ -225,14 +225,17 @@ class ScreenshotService:
         self.log.info(f"Processing task for {infohash_hex} at {timestamp}")
         handle = None
         infohash_bytes = None
-        save_dir = f"./downloads/{infohash_hex}"
+        save_dir = f"/tmp/downloads/{infohash_hex}"
         os.makedirs(save_dir, exist_ok=True)
 
         try:
             # Wait for the DHT to be ready before proceeding
+            self.log.debug("Waiting for DHT to be ready...")
             await self.dht_ready.wait()
+            self.log.debug("DHT is ready.")
 
             # 1. Add torrent using a magnet link and wait for metadata
+            self.log.debug("Waiting for metadata...")
             future = self.loop.create_future()
             infohash_bytes = binascii.unhexlify(infohash_hex)
             self.pending_metadata[str(infohash_bytes)] = future
@@ -288,10 +291,13 @@ class ScreenshotService:
                 handle.piece_priority(p, lt.download_priority.top_priority)
 
             self.log.info(f"Downloading header for {target_file.path} ({len(head_pieces)} pieces)...")
+            self.log.debug("Waiting for header pieces...")
             await self._wait_for_pieces(infohash_bytes, handle, head_pieces.copy())
+            self.log.debug("Header pieces finished.")
             self.log.info(f"Header for {target_file.path} downloaded.")
 
             # 4. Use PyAV with our custom file-like object to find the target keyframe
+            self.log.debug("Opening video container to find keyframe...")
             # PyAV需要一个可seek的对象，但我们只下载了部分文件。
             # 因此我们创建一个“稀疏文件”读取器，它模拟一个完整的文件。
             # 读取已下载的部分时，它返回真实数据；读取未下载的部分时，它返回零。
@@ -329,10 +335,13 @@ class ScreenshotService:
                     handle.piece_priority(p, lt.download_priority.top_priority)
 
                 self.log.info(f"Downloading keyframe data ({len(keyframe_pieces)} pieces from position {keyframe_pos})...")
+                self.log.debug("Waiting for keyframe pieces...")
                 await self._wait_for_pieces(infohash_bytes, handle, keyframe_pieces.copy())
+                self.log.debug("Keyframe pieces finished.")
                 self.log.info("Keyframe data downloaded.")
 
                 # 6. Take screenshot
+                self.log.debug("Opening final container for screenshot...")
                 # A new reader instance is cleaner as the old one's state is uncertain.
                 final_reader = TorrentFileReader(handle, video_file_index)
                 with av.open(final_reader) as final_container:

@@ -204,10 +204,22 @@ class ScreenshotService:
                 self.log.exception("Error in libtorrent alert loop.")
 
     async def _wait_for_pieces(self, infohash_bytes, handle, pieces_to_download):
+        # Filter out pieces that are already downloaded to avoid waiting for nothing.
+        pieces_to_actually_wait_for = {p for p in pieces_to_download if not handle.have_piece(p)}
+
+        if not pieces_to_actually_wait_for:
+            self.log.debug(f"All {len(pieces_to_download)} required pieces are already present.")
+            return
+
+        self.log.debug(f"Waiting for {len(pieces_to_actually_wait_for)} out of {len(pieces_to_download)} requested pieces.")
+
         future = self.loop.create_future()
-        self.pending_pieces[str(infohash_bytes)] = (future, pieces_to_download)
-        await asyncio.wait_for(future, timeout=180)
-        self.pending_pieces.pop(str(infohash_bytes), None)
+        self.pending_pieces[str(infohash_bytes)] = (future, pieces_to_actually_wait_for)
+        try:
+            await asyncio.wait_for(future, timeout=180)
+        finally:
+            # Ensure we clean up the pending future key, even if we time out
+            self.pending_pieces.pop(str(infohash_bytes), None)
 
     async def _handle_screenshot_task(self, infohash_hex, timestamp):
         self.log.info(f"Processing task for {infohash_hex} at {timestamp}")
@@ -321,18 +333,25 @@ class ScreenshotService:
                 self.log.info("Keyframe data downloaded.")
 
                 # 6. Take screenshot
-                # We need to re-open the reader or seek back to the keyframe packet
-                # A new instance of the reader is cleaner
+                # A new reader instance is cleaner as the old one's state is uncertain.
                 final_reader = TorrentFileReader(handle, video_file_index)
                 with av.open(final_reader) as final_container:
                     final_stream = final_container.streams.video[0]
-                    # Seek directly to the keyframe packet's position
-                    final_container.seek(packet.pts, stream=final_stream)
+                    # Seek directly to the keyframe packet's byte position for precision.
+                    final_container.seek(packet.pos, whence='byte')
 
                     frame = None
-                    for decoded_frame in final_container.decode(final_stream):
-                        frame = decoded_frame
-                        break # Decode only the first frame found at this position
+                    # Use a more robust, explicit demux/decode loop.
+                    for p in final_container.demux(final_stream):
+                        # Skip packets that are not from our target video stream
+                        if p.dts is None or p.stream.index != final_stream.index:
+                            continue
+
+                        # Decode the packet. It may contain multiple frames.
+                        frames = p.decode()
+                        if frames:
+                            frame = frames[0]
+                            break  # Success, we got our frame.
 
                     if frame:
                         output_dir = "/tmp/screenshots"

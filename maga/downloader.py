@@ -186,38 +186,68 @@ class Downloader:
     async def submit(self, infohash):
         await self.download_queue.put(infohash)
 
+    async def _try_download_from_peer(self, infohash, peer_addr):
+        ip, port = peer_addr
+        client = WirePeerClient(infohash, loop=self.loop)
+        try:
+            await client.connect(ip, port)
+            metadata = await asyncio.wait_for(client.work(), timeout=10)
+            if metadata:
+                return metadata
+        finally:
+            client.close()
+        return None
+
     async def _worker(self):
         while self._running:
+            tasks = set()
             try:
                 infohash = await self.download_queue.get()
                 infohash_hex = binascii.hexlify(infohash).decode()
 
                 peers = await self.dht_node.get_peers(infohash)
                 if not peers:
-                    print(f"[Worker] Could not find peers for {infohash_hex}")
+                    self.log.warning(f"Could not find peers for {infohash_hex}")
                     continue
 
-                for ip, port in peers:
-                    client = WirePeerClient(infohash, loop=self.loop)
-                    try:
-                        await client.connect(ip, port)
-                        metadata = await asyncio.wait_for(client.work(), timeout=10)
-                        if metadata:
-                            info = metadata.get(b'info', {})
-                            file_name = info.get(b'name', b'Unknown').decode(errors='ignore')
-                            self.log.info(f"Successfully downloaded metadata for '{file_name}' ({infohash_hex})")
-                            await self.results_queue.put((infohash, metadata))
+                tasks = {
+                    self.loop.create_task(self._try_download_from_peer(infohash, peer))
+                    for peer in peers
+                }
+
+                metadata = None
+                while tasks and not metadata:
+                    done, pending = await asyncio.wait(
+                        tasks, return_when=asyncio.FIRST_COMPLETED
+                    )
+
+                    for task in done:
+                        result = task.result()
+                        if result:
+                            metadata = result
+                            # First one to succeed wins, cancel the rest
+                            for p in pending:
+                                p.cancel()
                             break
-                    except Exception:
-                        continue
-                    finally:
-                        client.close()
+
+                    # The next set of tasks to wait for are the pending ones
+                    tasks = pending
+
+                if metadata:
+                    info = metadata.get(b'info', {})
+                    file_name = info.get(b'name', b'Unknown').decode(errors='ignore')
+                    self.log.info(f"Successfully downloaded metadata for '{file_name}' ({infohash_hex})")
+                    await self.results_queue.put((infohash, metadata))
                 else:
-                    print(f"[Worker] FAILURE: Could not download metadata from any peers for {infohash_hex}")
+                    # This only happens if all tasks fail
+                    self.log.warning(f"Could not download metadata from any of the {len(peers)} peers for {infohash_hex}")
 
             except asyncio.CancelledError:
                 break
             except Exception:
                 self.log.exception("An error occurred in a downloader worker.")
             finally:
+                # Final cleanup
+                for task in tasks:
+                    task.cancel()
                 self.download_queue.task_done()

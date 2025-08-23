@@ -21,6 +21,17 @@ logging.getLogger("DHTNode").setLevel(logging.DEBUG)
 SUBMITTED_INFOHASHES = set()
 
 
+async def print_dht_stats(downloader):
+    """
+    一个辅助函数，每10秒打印一次DHT路由表的状态
+    """
+    while True:
+        await asyncio.sleep(10)
+        # 从downloader服务中获取其内部的dht_node实例，并打印路由表节点总数
+        table_size = len(downloader.dht_node.routing_table.get_all_nodes())
+        print(f"[状态] DHT路由表当前包含 {table_size} 个节点。")
+
+
 async def main():
     # 获取当前的asyncio事件循环
     loop = asyncio.get_running_loop()
@@ -55,6 +66,9 @@ async def main():
     # 爬虫服务运行在6881端口
     await crawler.run(port=6881)
 
+    # 启动状态打印任务
+    stats_task = loop.create_task(print_dht_stats(downloader))
+
     print("\n爬虫和下载器服务已开始运行。")
     print("爬虫正在监听新的种子...")
     print("下载器正在等待任务并下载元数据...")
@@ -67,6 +81,7 @@ async def main():
 
     # 6. 优雅地关闭服务
     print("\n正在停止服务...")
+    stats_task.cancel()
     downloader.stop()
     crawler.stop()
     print("服务已停止。")

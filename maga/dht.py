@@ -31,11 +31,15 @@ class Lookup:
                 self.nodes_to_query.append(Node(None, ip, port))
 
     async def start(self):
+        self.log.debug(f"Starting lookup. Initial nodes to query: {len(self.nodes_to_query)}")
         self._send_queries()
         try:
+            self.log.debug("Waiting for lookup future...")
             return await asyncio.wait_for(self.future, timeout=10)
         except asyncio.TimeoutError:
             self.log.debug(f"Lookup for {self.target_id.hex()} timed out.")
+            if not self.future.done():
+                self.future.set_result(None)
             return None
 
     def _send_queries(self):

@@ -1,9 +1,20 @@
 import asyncio
 import signal
 import binascii
+import logging
 
 from maga.crawler import Maga
 from maga.downloader import Downloader
+
+# 配置日志记录器
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+# 将我们自己的下载器日志级别设为DEBUG，以获取更详细的输出
+logging.getLogger("DHTNode").setLevel(logging.DEBUG)
+
 
 # 使用一个集合（set）来记录已经提交给下载器的infohash
 # 这是为了防止爬虫因为频繁收到同一个infohash的announce消息而重复提交任务

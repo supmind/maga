@@ -5,6 +5,8 @@ import struct
 import math
 
 import bencode2 as bencoder
+import logging
+
 from . import utils
 
 
@@ -163,6 +165,7 @@ class Downloader:
         self.num_workers = num_workers
         self.workers = []
         self._running = False
+        self.log = logging.getLogger("Downloader")
 
     async def run(self):
         await self.dht_node.run()
@@ -213,6 +216,6 @@ class Downloader:
             except asyncio.CancelledError:
                 break
             except Exception:
-                pass
+                self.log.exception("An error occurred in a downloader worker.")
             finally:
                 self.download_queue.task_done()

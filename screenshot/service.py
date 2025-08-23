@@ -407,14 +407,19 @@ class ScreenshotService:
             self.log.debug("Opening final container for screenshot...")
             final_reader = TorrentFileReader(self, handle, video_file_index)
             with av.open(final_reader) as final_container:
-                final_container.seek(packet.pos, whence='byte')
-                for frame in final_container.decode(video=0):
-                    output_dir = "/tmp/screenshots"
-                    output_filename = f"{output_dir}/{infohash_hex}_{timestamp.replace(':', '-')}.jpg"
-                    os.makedirs(output_dir, exist_ok=True)
-                    frame.to_image().save(output_filename)
-                    self.log.info(f"SUCCESS: Screenshot saved to {output_filename}")
-                    break # We only need the first frame
+                # The `seek` method in PyAV does not support `whence='byte'`.
+                # Instead, we must demux from the beginning and find our packet by its byte position.
+                for p in final_container.demux(video=0):
+                    if p.pos == packet.pos:
+                        frames = p.decode()
+                        if frames:
+                            frame = frames[0]
+                            output_dir = "/tmp/screenshots"
+                            output_filename = f"{output_dir}/{infohash_hex}_{timestamp.replace(':', '-')}.jpg"
+                            os.makedirs(output_dir, exist_ok=True)
+                            frame.to_image().save(output_filename)
+                            self.log.info(f"SUCCESS: Screenshot saved to {output_filename}")
+                        break  # We found and processed our packet, so we can stop.
 
     async def _worker(self):
         while self._running:

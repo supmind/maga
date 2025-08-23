@@ -39,3 +39,8 @@ KRPC_PING_TID = "pg"
 
 # Error message
 KRPC_SERVER_ERROR = [202, "Server Error"]
+
+# Kademlia constants
+K = 8  # K-bucket size
+MIN_NODE_ID = 0
+MAX_NODE_ID = 2**160 - 1

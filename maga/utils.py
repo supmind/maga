@@ -25,3 +25,10 @@ def split_nodes(nodes):
         ip = inet_ntoa(nodes[i+20:i+24])
         port = unpack("!H", nodes[i+24:i+26])[0]
         yield nid, ip, port
+
+
+def get_distance(node1_id, node2_id):
+    """
+    Calculate the XOR distance between two node IDs.
+    """
+    return int.from_bytes(node1_id, 'big') ^ int.from_bytes(node2_id, 'big')

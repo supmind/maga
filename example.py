@@ -1,49 +1,37 @@
-import multiprocessing
-import os
-import time
+import asyncio
+from maga.crawler import Maga
 
-# We must import libtorrent here to check the version in this process
-try:
-    import libtorrent as lt
-    MAIN_LT_VERSION = lt.version
-except Exception as e:
-    MAIN_LT_VERSION = f"Error importing or getting version in main process: {e}"
-
-
-def downloader_service_bootstrap():
+async def print_stats(crawler):
     """
-    This function is the entry point for the downloader service process.
-    It will import the service and run its test.
+    Prints the number of nodes in the routing table every 10 seconds.
     """
-    # This import happens in the child process
-    from screenshot_system.download_service import DownloaderService
+    while True:
+        # Wait a bit for the crawler to start finding nodes
+        await asyncio.sleep(10)
+        print(f"[Stats] Nodes in routing table: {len(crawler.routing_table.get_all_nodes())}")
 
-    service = DownloaderService()
-    service.run()
+        # You can also print bucket information for more detail
+        # for i, bucket in enumerate(crawler.routing_table.buckets):
+        #     print(f"  Bucket {i}: {len(bucket)} nodes")
 
 if __name__ == "__main__":
-    print("--- libtorrent Version Test ---")
-    print(f"[Main] libtorrent version in main process: {MAIN_LT_VERSION}")
+    print("Starting DHT crawler...")
+    print("Press Ctrl+C to stop.")
 
-    # Clean up old log file
-    if os.path.exists('downloader_service.log'):
-        os.remove('downloader_service.log')
+    loop = asyncio.get_event_loop()
+    crawler = Maga(loop=loop)
 
-    print("[Main] Starting Downloader Service for version test...")
-    downloader_process = multiprocessing.Process(
-        target=downloader_service_bootstrap,
-        daemon=True
-    )
-    downloader_process.start()
+    # Schedule the stats printer to run in the background
+    asyncio.ensure_future(print_stats(crawler), loop=loop)
 
-    # Wait for the child process to finish its work (logging to the file)
-    print("[Main] Waiting for service process to complete test...")
-    downloader_process.join(timeout=15)
-
-    if downloader_process.is_alive():
-        print("[Main] Test process timed out.")
-        downloader_process.terminate()
-
-    print("\n--- Test Complete ---")
-    print("Please check the contents of the 'downloader_service.log' file for the service's version report.")
-    print("Compare it with the version printed above for the main process.")
+    try:
+        # This call will block and run the event loop, executing all scheduled tasks.
+        crawler.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("\nCrawler stopping...")
+        # The stop() method is already called by the signal handler inside run(),
+        # but we can call it here just in case. The loop is also stopped
+        # and closed inside the crawler's run/stop methods.
+        crawler.stop()

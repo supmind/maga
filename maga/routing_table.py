@@ -1,0 +1,111 @@
+import bisect
+from collections import OrderedDict
+
+from . import constants
+from .utils import get_distance
+
+
+class KBucket:
+    def __init__(self, min_id, max_id):
+        self.min_id = min_id
+        self.max_id = max_id
+        self.nodes = OrderedDict()
+
+    def add_node(self, node):
+        self.nodes[node.node_id] = node
+
+    def remove_node(self, node):
+        if node.node_id in self.nodes:
+            del self.nodes[node.node_id]
+
+    def get_node(self, node_id):
+        return self.nodes.get(node_id)
+
+    def get_all_nodes(self):
+        return list(self.nodes.values())
+
+    def __contains__(self, node_id):
+        return self.min_id <= node_id < self.max_id
+
+    def __len__(self):
+        return len(self.nodes)
+
+    def __repr__(self):
+        return f"<KBucket(min={self.min_id.hex()}, max={self.max_id.hex()})>"
+
+
+class RoutingTable:
+    def __init__(self, node_id):
+        self.node_id = node_id
+        self.buckets = [
+            KBucket(constants.MIN_NODE_ID, constants.MAX_NODE_ID)
+        ]
+
+    def get_bucket_for_node(self, node_id):
+        for bucket in self.buckets:
+            if node_id in bucket:
+                return bucket
+        # This should not happen
+        return None
+
+    def add_node(self, node):
+        if node.node_id == self.node_id:
+            return
+
+        bucket = self.get_bucket_for_node(node.node_id)
+
+        # If node is already in the bucket, update it (move to end)
+        if bucket.get_node(node.node_id):
+            bucket.remove_node(node)
+            bucket.add_node(node)
+            return
+
+        if len(bucket) < constants.K:
+            bucket.add_node(node)
+            return
+
+        # If the bucket is full, we may need to split it
+        if self.node_id in bucket:
+            self.split_bucket(bucket)
+            # After splitting, try to add the node again
+            self.add_node(node)
+        else:
+            # If our own node is not in this bucket, we can't split it.
+            # The bucket is full. We can either ping the oldest node to
+            # see if it's still alive, or just discard the new node.
+            # For now, we'll just discard it.
+            pass
+
+    def split_bucket(self, bucket):
+        split_point = bucket.min_id + (bucket.max_id - bucket.min_id) // 2
+
+        new_bucket = KBucket(split_point, bucket.max_id)
+        bucket.max_id = split_point
+
+        # Find the index of the bucket to split
+        idx = self.buckets.index(bucket)
+        self.buckets.insert(idx + 1, new_bucket)
+
+        # Redistribute nodes
+        nodes_to_move = [
+            node for node in bucket.get_all_nodes() if node.node_id >= split_point
+        ]
+
+        for node in nodes_to_move:
+            bucket.remove_node(node)
+            new_bucket.add_node(node)
+
+    def find_closest_nodes(self, target_id, count=constants.K):
+        nodes = []
+        for bucket in self.buckets:
+            nodes.extend(bucket.get_all_nodes())
+
+        nodes.sort(key=lambda node: get_distance(node.node_id, target_id))
+
+        return nodes[:count]
+
+    def get_all_nodes(self):
+        nodes = []
+        for bucket in self.buckets:
+            nodes.extend(bucket.get_all_nodes())
+        return nodes

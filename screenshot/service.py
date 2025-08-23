@@ -8,6 +8,9 @@ import libtorrent as lt
 import threading
 from concurrent.futures import Future
 
+class LibtorrentError(Exception):
+    pass
+
 # ==============================================================================
 # TorrentFileReader: A file-like object for reading from a torrent
 # ==============================================================================
@@ -197,7 +200,7 @@ class ScreenshotService:
             future = self.pending_reads.pop(alert.piece, None)
         if future:
             if alert.error:
-                future.set_exception(alert.error)
+                future.set_exception(LibtorrentError(alert.error))
             else:
                 future.set_result(bytes(alert.buffer))
 

@@ -209,7 +209,7 @@ class ScreenshotService:
             except Exception:
                 self.log.exception("Error in libtorrent alert loop.")
 
-    async def _wait_for_pieces(self, infohash_bytes, handle, pieces_to_download):
+    async def _wait_for_pieces(self, infohash_hex, handle, pieces_to_download):
         # Filter out pieces that are already downloaded to avoid waiting for nothing.
         pieces_to_actually_wait_for = {p for p in pieces_to_download if not handle.have_piece(p)}
 
@@ -220,12 +220,12 @@ class ScreenshotService:
         self.log.debug(f"Waiting for {len(pieces_to_actually_wait_for)} out of {len(pieces_to_download)} requested pieces.")
 
         future = self.loop.create_future()
-        self.pending_pieces[str(infohash_bytes)] = (future, pieces_to_actually_wait_for)
+        self.pending_pieces[infohash_hex] = (future, pieces_to_actually_wait_for)
         try:
             await asyncio.wait_for(future, timeout=180)
         finally:
             # Ensure we clean up the pending future key, even if we time out
-            self.pending_pieces.pop(str(infohash_bytes), None)
+            self.pending_pieces.pop(infohash_hex, None)
 
     async def _handle_screenshot_task(self, infohash_hex, timestamp):
         self.log.info(f"Processing task for {infohash_hex} at {timestamp}")
@@ -240,7 +240,7 @@ class ScreenshotService:
             # 1. Add torrent using a magnet link.
             # This will trigger the DHT to start if it hasn't already.
             future = self.loop.create_future()
-            self.pending_metadata[str(infohash_bytes)] = future
+            self.pending_metadata[infohash_hex] = future
 
             trackers = [
                 "udp://tracker.openbittorrent.com:80",
@@ -301,7 +301,7 @@ class ScreenshotService:
 
             self.log.info(f"Downloading header for {target_file.path} ({len(head_pieces)} pieces)...")
             self.log.debug("Waiting for header pieces...")
-            await self._wait_for_pieces(infohash_bytes, handle, head_pieces.copy())
+            await self._wait_for_pieces(infohash_hex, handle, head_pieces.copy())
             self.log.debug("Header pieces finished.")
             self.log.info(f"Header for {target_file.path} downloaded.")
 
@@ -345,7 +345,7 @@ class ScreenshotService:
 
                 self.log.info(f"Downloading keyframe data ({len(keyframe_pieces)} pieces from position {keyframe_pos})...")
                 self.log.debug("Waiting for keyframe pieces...")
-                await self._wait_for_pieces(infohash_bytes, handle, keyframe_pieces.copy())
+                await self._wait_for_pieces(infohash_hex, handle, keyframe_pieces.copy())
                 self.log.debug("Keyframe pieces finished.")
                 self.log.info("Keyframe data downloaded.")
 
@@ -386,8 +386,8 @@ class ScreenshotService:
             self.log.exception(f"Error processing {infohash_hex}")
         finally:
             # 7. Clean up
-            if infohash_bytes:
-                self.pending_metadata.pop(str(infohash_bytes), None)
+            if infohash_hex:
+                self.pending_metadata.pop(infohash_hex, None)
             if handle:
                 self.ses.remove_torrent(handle, lt.session.delete_files)
 

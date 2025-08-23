@@ -34,6 +34,10 @@ class TorrentFileReader(io.RawIOBase):
         self.file_size = self.file_entry.size
         self.pos = 0
 
+        # Cache for the last read piece to avoid redundant reads
+        self.last_read_piece_index = -1
+        self.last_read_piece_data = None
+
         self.log = logging.getLogger("TorrentFileReader")
 
     def readable(self):
@@ -78,19 +82,27 @@ class TorrentFileReader(io.RawIOBase):
             if not self.handle.have_piece(piece_index):
                 result_buffer[buffer_offset : buffer_offset + read_len] = b'\x00' * read_len
             else:
-                future = Future()
-                with self.service.read_lock:
-                    self.service.pending_reads[piece_index] = future
+                piece_data = None
+                # Check cache first
+                if self.last_read_piece_index == piece_index:
+                    piece_data = self.last_read_piece_data
+                else:
+                    future = Future()
+                    with self.service.read_lock:
+                        self.service.pending_reads[piece_index] = future
 
-                # This is now thread-safe because it's running in the executor.
-                # The main event loop is free to process the read_piece_alert.
-                self.handle.read_piece(piece_index)
+                    self.handle.read_piece(piece_index)
+                    piece_data = future.result(timeout=60)
 
-                # This call will block the *current thread* (not the event loop)
-                # until the future is resolved in the main thread's alert loop.
-                piece_data = future.result(timeout=60)
+                    # Update cache
+                    self.last_read_piece_index = piece_index
+                    self.last_read_piece_data = piece_data
 
                 if piece_data is None:
+                    # This can happen if the read times out or fails.
+                    # We'll clear the cache and raise an error.
+                    self.last_read_piece_index = -1
+                    self.last_read_piece_data = None
                     raise IOError(f"Failed to read piece {piece_index}: read_piece returned None")
 
                 chunk = piece_data[piece_offset : piece_offset + read_len]
@@ -236,7 +248,7 @@ class ScreenshotService:
                         self._handle_tracker_reply(alert)
 
                 # Sleep to yield control to the event loop
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0)
             except asyncio.CancelledError:
                 break
             except Exception:

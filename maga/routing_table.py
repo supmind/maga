@@ -24,13 +24,13 @@ class KBucket:
         return list(self.nodes.values())
 
     def __contains__(self, node_id):
-        return self.min_id <= node_id < self.max_id
+        return self.min_id <= int.from_bytes(node_id, 'big') < self.max_id
 
     def __len__(self):
         return len(self.nodes)
 
     def __repr__(self):
-        return f"<KBucket(min=0x{self.min_id.hex()}, max=0x{self.max_id.hex()})>"
+        return f"<KBucket(min={self.min_id}, max={self.max_id})>"
 
 
 class RoutingTable:
@@ -74,7 +74,7 @@ class RoutingTable:
         self.buckets.insert(idx + 1, new_bucket)
 
         nodes_to_move = [
-            node for node in bucket.get_all_nodes() if node.node_id >= split_point
+            node for node in bucket.get_all_nodes() if int.from_bytes(node.node_id, 'big') >= split_point
         ]
 
         for node in nodes_to_move:

@@ -80,7 +80,7 @@ class TorrentFileReader(io.RawIOBase):
             read_len = min(bytes_to_go, bytes_available_in_piece)
 
             if not self.handle.have_piece(piece_index):
-                result_buffer[buffer_offset : buffer_offset + read_len] = b'\x00' * read_len
+                raise IOError(f"BUG: Piece {piece_index} is not available, but it should have been pre-fetched.")
             else:
                 piece_data = None
                 # Check cache first
@@ -330,7 +330,7 @@ class ScreenshotService:
             # 3. Prioritize and download file header
             piece_size = ti.piece_length()
             # Let's download a bit more for the header to be safe with various video formats
-            header_size_to_download = 2 * 1024 * 1024
+            header_size_to_download = 5 * 1024 * 1024
             # Ensure we don't try to download more than the file size
             header_size_to_download = min(header_size_to_download, target_file.size)
 
@@ -433,12 +433,15 @@ class ScreenshotService:
 
     async def _worker(self):
         while self._running:
+            got_task = False
             try:
                 infohash, timestamp = await self.task_queue.get()
+                got_task = True
                 await self._handle_screenshot_task(infohash, timestamp)
             except asyncio.CancelledError:
                 break
             except Exception:
                 self.log.exception("Error in screenshot worker.")
             finally:
-                self.task_queue.task_done()
+                if got_task:
+                    self.task_queue.task_done()

@@ -4,3 +4,4 @@ bencode2
 
 # For video processing
 av
+Pillow

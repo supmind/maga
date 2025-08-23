@@ -105,7 +105,7 @@ class ScreenshotService:
         settings = {
             'listen_interfaces': '0.0.0.0:6881',
             'enable_dht': True,
-            'alert_mask': lt.alert_category.all,
+            'alert_mask': lt.alert_category.error_notification,
             'dht_bootstrap_nodes': 'router.bittorrent.com:6881,dht.transmissionbt.com:6881,router.utorrent.com:6881'
         }
         self.ses = lt.session(settings)

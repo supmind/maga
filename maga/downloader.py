@@ -194,6 +194,13 @@ class Downloader:
             metadata = await asyncio.wait_for(client.work(), timeout=10)
             if metadata:
                 return metadata
+        except (ConnectionRefusedError, asyncio.exceptions.IncompleteReadError,
+                asyncio.TimeoutError, OSError):
+            # These are expected network errors when dealing with P2P, so we ignore them
+            pass
+        except Exception:
+            # Log other, unexpected errors, but don't crash the worker
+            self.log.exception(f"Unexpected error while downloading from peer {ip}:{port}")
         finally:
             client.close()
         return None

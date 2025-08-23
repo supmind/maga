@@ -305,7 +305,7 @@ class ScreenshotService:
                 return
 
             for p in head_pieces:
-                handle.piece_priority(p, lt.top_priority)
+                handle.piece_priority(p, 7)
 
             self.log.info(f"Downloading header for {target_file.path} ({len(head_pieces)} pieces)...")
             self.log.debug("Waiting for header pieces...")
@@ -351,7 +351,7 @@ class ScreenshotService:
                 keyframe_pieces = set(range(start_piece_req.piece, end_piece_req.piece + 1))
 
                 for p in keyframe_pieces:
-                    handle.piece_priority(p, lt.top_priority)
+                    handle.piece_priority(p, 7)
 
                 self.log.info(f"Downloading keyframe data ({len(keyframe_pieces)} pieces from position {keyframe_pos})...")
                 self.log.debug("Waiting for keyframe pieces...")

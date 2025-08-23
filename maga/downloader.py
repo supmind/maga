@@ -151,14 +151,68 @@ class WirePeerClient:
                 self.request_piece(self.pieces_received_num)
 
 
-async def get_metadata(infohash, ip, port, loop=None):
-    if not loop:
-        loop = asyncio.get_event_loop()
+from .dht import DHTNode
 
-    client = WirePeerClient(infohash, loop=loop)
-    try:
-        await client.connect(ip, port)
-        return await asyncio.wait_for(client.work(), timeout=5)
-    except Exception as e:
-        client.close()
-        return False
+
+class Downloader:
+    def __init__(self, loop=None, dht_port=6882, num_workers=10):
+        self.loop = loop or asyncio.get_event_loop()
+        self.dht_node = DHTNode(loop=self.loop)
+        self.dht_port = dht_port
+        self.download_queue = asyncio.Queue()
+        self.num_workers = num_workers
+        self.workers = []
+        self._running = False
+
+    async def run(self):
+        await self.dht_node.run(port=self.dht_port)
+        self._running = True
+        for _ in range(self.num_workers):
+            worker_task = self.loop.create_task(self._worker())
+            self.workers.append(worker_task)
+        print(f"Downloader service started with {self.num_workers} workers on DHT port {self.dht_port}.")
+
+    def stop(self):
+        self._running = False
+        self.dht_node.stop()
+        for worker in self.workers:
+            worker.cancel()
+        print("Downloader service stopped.")
+
+    async def submit(self, infohash):
+        await self.download_queue.put(infohash)
+
+    async def _worker(self):
+        while self._running:
+            try:
+                infohash = await self.download_queue.get()
+                infohash_hex = binascii.hexlify(infohash).decode()
+
+                peers = await self.dht_node.get_peers(infohash)
+                if not peers:
+                    print(f"[Worker] Could not find peers for {infohash_hex}")
+                    continue
+
+                for ip, port in peers:
+                    client = WirePeerClient(infohash, loop=self.loop)
+                    try:
+                        await client.connect(ip, port)
+                        metadata = await asyncio.wait_for(client.work(), timeout=10)
+                        if metadata:
+                            info = metadata.get(b'info', {})
+                            file_name = info.get(b'name', b'Unknown').decode(errors='ignore')
+                            print(f"[Worker] SUCCESS: Downloaded metadata for '{file_name}' ({infohash_hex})")
+                            break
+                    except Exception:
+                        continue
+                    finally:
+                        client.close()
+                else:
+                    print(f"[Worker] FAILURE: Could not download metadata from any peers for {infohash_hex}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+            finally:
+                self.download_queue.task_done()

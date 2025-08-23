@@ -10,12 +10,73 @@ from .node import Node
 from .routing_table import RoutingTable
 
 
+class Lookup:
+    def __init__(self, loop, dht_node, target_id):
+        self.loop = loop
+        self.dht_node = dht_node
+        self.target_id = target_id
+
+        self.future = asyncio.Future(loop=self.loop)
+        self.queried_nodes = set()
+        self.pending_nodes = set()
+
+        self.nodes_to_query = dht_node.routing_table.find_closest_nodes(target_id)
+
+    async def start(self):
+        self._send_queries()
+        try:
+            return await asyncio.wait_for(self.future, timeout=10)
+        except asyncio.TimeoutError:
+            return None
+
+    def _send_queries(self):
+        for node in self.nodes_to_query:
+            if len(self.pending_nodes) >= constants.K:
+                break
+            if node.node_id not in self.queried_nodes and node.node_id not in self.pending_nodes:
+                self.dht_node._send_get_peers_to_node(node, self.target_id, self)
+                self.pending_nodes.add(node.node_id)
+
+    def handle_response(self, sender_id, response_args):
+        self.pending_nodes.discard(sender_id)
+        self.queried_nodes.add(sender_id)
+
+        if b'values' in response_args:
+            peers = []
+            for peer_info in response_args[b'values']:
+                try:
+                    ip = socket.inet_ntoa(peer_info[:4])
+                    port = int.from_bytes(peer_info[4:6], 'big')
+                    peers.append((ip, port))
+                except:
+                    continue
+            if peers and not self.future.done():
+                self.future.set_result(peers)
+
+        elif b'nodes' in response_args:
+            new_nodes = []
+            for node_id, ip, port in utils.split_nodes(response_args[b'nodes']):
+                new_nodes.append(Node(node_id, ip, port))
+
+            self.nodes_to_query.extend(new_nodes)
+            self.nodes_to_query.sort(key=lambda n: utils.get_distance(n.node_id, self.target_id))
+
+            if not self.pending_nodes and not self.future.done():
+                 if not any(node.node_id not in self.queried_nodes for node in self.nodes_to_query):
+                    self.future.set_result(None)
+
+            if not self.future.done():
+                self._send_queries()
+
+
 class DHTNode(asyncio.DatagramProtocol):
     def __init__(self, loop=None, bootstrap_nodes=constants.BOOTSTRAP_NODES, interval=5):
         self.node_id = utils.random_node_id()
         self.transport = None
         self.loop = loop or asyncio.get_event_loop()
         self.routing_table = RoutingTable(self.node_id)
+        self.pending_lookups = {}
+        self.find_nodes_task = None
 
         resolved_bootstrap_nodes = []
         for host, port in bootstrap_nodes:
@@ -71,6 +132,16 @@ class DHTNode(asyncio.DatagramProtocol):
             )
 
     def handle_response(self, msg, addr):
+        tid = msg.get(constants.KRPC_T)
+        if tid in self.pending_lookups:
+            lookup = self.pending_lookups[tid]
+            sender_id = msg.get(constants.KRPC_R, {}).get(constants.KRPC_ID)
+            if sender_id:
+                lookup.handle_response(sender_id, msg.get(constants.KRPC_R, {}))
+            if lookup.future.done():
+                del self.pending_lookups[tid]
+            return
+
         args = msg.get(constants.KRPC_R, {})
         sender_id = args.get(constants.KRPC_ID)
         if sender_id:
@@ -79,6 +150,26 @@ class DHTNode(asyncio.DatagramProtocol):
         if constants.KRPC_NODES in args:
             for node_id, ip, port in utils.split_nodes(args[constants.KRPC_NODES]):
                 self.add_seen_node(node_id, ip, port)
+
+    async def get_peers(self, infohash):
+        lookup = Lookup(self.loop, self, infohash)
+        return await lookup.start()
+
+    def _send_get_peers_to_node(self, node, infohash, lookup):
+        tid = os.urandom(2)
+        while tid in self.pending_lookups:
+            tid = os.urandom(2)
+        self.pending_lookups[tid] = lookup
+
+        self.send_message({
+            constants.KRPC_T: tid,
+            constants.KRPC_Y: constants.KRPC_QUERY,
+            constants.KRPC_Q: constants.KRPC_GET_PEERS,
+            constants.KRPC_A: {
+                constants.KRPC_ID: self.node_id,
+                constants.KRPC_INFO_HASH: infohash
+            }
+        }, (node.ip, node.port))
 
     async def handle_query(self, msg, addr):
         args = msg.get(constants.KRPC_A, {})

@@ -1,50 +1,58 @@
 import asyncio
 import signal
+import binascii
 
 from maga.crawler import Maga
-from maga.dht import DHTNode
+from maga.downloader import Downloader
 
-async def print_stats(dht_node):
-    """
-    Prints the number of nodes in the DHTNode's routing table every 10 seconds.
-    """
-    while True:
-        await asyncio.sleep(10)
-        print(f"[Stats] DHT Node knows {len(dht_node.routing_table.get_all_nodes())} nodes.")
-        # You can also print bucket information for more detail
-        # for i, bucket in enumerate(dht_node.routing_table.buckets):
-        #     print(f"  Bucket {i}: {len(bucket)} nodes")
+# A set to keep track of infohashes we've already submitted to the downloader
+# This is to prevent the crawler from flooding the download queue with the same
+# infohash if it's announced frequently.
+SUBMITTED_INFOHASHES = set()
 
 
 async def main():
     loop = asyncio.get_running_loop()
 
-    # Create instances of the crawler and the DHT node
-    crawler = Maga(loop=loop)
-    dht_node = DHTNode(loop=loop)
+    # 1. Create the Downloader service
+    # This service runs its own DHT node and a pool of workers
+    downloader = Downloader(loop=loop, dht_port=6882, num_workers=10)
 
-    # Start the services on different ports
+    # 2. Define the handler for the Crawler
+    # This function will be called by the crawler when it finds an infohash.
+    # Its job is to submit the infohash to the downloader's queue.
+    async def crawler_handler(infohash, peer_addr):
+        infohash_hex = binascii.hexlify(infohash).decode()
+        if infohash_hex not in SUBMITTED_INFOHASHES:
+            SUBMITTED_INFOHASHES.add(infohash_hex)
+            print(f"[Crawler] Discovered new infohash: {infohash_hex}. Submitting to downloader.")
+            await downloader.submit(infohash)
+
+    # 3. Create the Crawler service
+    # We pass our handler to it.
+    crawler = Maga(loop=loop, handler=crawler_handler)
+
+    # 4. Start both services
+    # The Downloader runs its DHT node on port 6882
+    await downloader.run()
+
+    # The Crawler runs on port 6881
     await crawler.run(port=6881)
-    print("Lightweight crawler started on port 6881.")
 
-    await dht_node.run(port=6882)
-    print("DHT node for downloader started on port 6882.")
+    print("\nCrawler and Downloader services are running.")
+    print("Crawler listens for new torrents.")
+    print("Downloader waits for tasks and downloads metadata.")
+    print("Press Ctrl+C to stop.")
 
-    # Start the stats printer
-    stats_task = loop.create_task(print_stats(dht_node))
-
-    print("\nRunning both services. Press Ctrl+C to stop.")
-
-    # Wait for Ctrl+C
+    # 5. Wait for graceful shutdown
     stop = asyncio.Future()
     loop.add_signal_handler(signal.SIGINT, stop.set_result, None)
     await stop
 
-    # Clean up
+    # 6. Clean up
     print("\nStopping services...")
-    stats_task.cancel()
+    downloader.stop()
     crawler.stop()
-    dht_node.stop()
     print("Services stopped.")
 
 

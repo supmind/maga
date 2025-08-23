@@ -19,10 +19,11 @@ __version__ = '3.0.0'
 
 
 class Maga(asyncio.DatagramProtocol):
-    def __init__(self, loop=None, bootstrap_nodes=constants.BOOTSTRAP_NODES, interval=1):
+    def __init__(self, loop=None, bootstrap_nodes=constants.BOOTSTRAP_NODES, interval=1, handler=None):
         self.node_id = utils.random_node_id()
         self.transport = None
         self.loop = loop or asyncio.get_event_loop()
+        self.handler = handler or self._default_handler
 
         resolved_bootstrap_nodes = []
         for host, port in bootstrap_nodes:
@@ -35,6 +36,7 @@ class Maga(asyncio.DatagramProtocol):
 
         self.__running = False
         self.interval = interval
+        self.find_nodes_task = None
 
     def connection_made(self, transport):
         self.transport = transport
@@ -110,12 +112,15 @@ class Maga(asyncio.DatagramProtocol):
                     self.ping(addr=(ip, port))
 
     async def handle_query(self, msg, addr):
-        args = msg[constants.KRPC_A]
-        node_id = args[constants.KRPC_ID]
-        query_type = msg[constants.KRPC_Q]
+        args = msg.get(constants.KRPC_A, {})
+        node_id = args.get(constants.KRPC_ID)
+        query_type = msg.get(constants.KRPC_Q)
+
+        if not all([node_id, query_type]):
+            return
+
         if query_type == constants.KRPC_GET_PEERS:
             infohash = args[constants.KRPC_INFO_HASH]
-            infohash = utils.proper_infohash(infohash)
             token = infohash[:2]
             self.send_message({
                 constants.KRPC_T: msg[constants.KRPC_T],
@@ -126,7 +131,6 @@ class Maga(asyncio.DatagramProtocol):
                     constants.KRPC_TOKEN: token
                 }
             }, addr=addr)
-            await self.handle_get_peers(infohash, addr)
         elif query_type == constants.KRPC_ANNOUNCE_PEER:
             infohash = args[constants.KRPC_INFO_HASH]
             tid = msg[constants.KRPC_T]
@@ -137,13 +141,16 @@ class Maga(asyncio.DatagramProtocol):
                     constants.KRPC_ID: self.fake_node_id(node_id)
                 }
             }, addr=addr)
+
             if args.get(constants.KRPC_IMPLIED_PORT, 0) != 0:
                 peer_port = addr[1]
             else:
                 peer_port = args[constants.KRPC_PORT]
             peer_addr = (addr[0], peer_port)
-            await self.handle_announce_peer(
-                utils.proper_infohash(infohash), addr, peer_addr
+
+            asyncio.ensure_future(
+                self.handler(utils.proper_infohash(infohash), peer_addr),
+                loop=self.loop
             )
         elif query_type == constants.KRPC_FIND_NODE:
             tid = msg[constants.KRPC_T]
@@ -157,12 +164,13 @@ class Maga(asyncio.DatagramProtocol):
             }, addr=addr)
         elif query_type == constants.KRPC_PING:
             self.send_message({
-                constants.KRPC_T: constants.KRPC_DEFAULT_TID,
+                constants.KRPC_T: msg[constants.KRPC_T],
                 constants.KRPC_Y: constants.KRPC_RESPONSE,
                 constants.KRPC_R: {
                     constants.KRPC_ID: self.fake_node_id(node_id)
                 }
             }, addr=addr)
+
         self.find_node(addr=addr, node_id=node_id)
 
     def ping(self, addr, node_id=None):
@@ -193,11 +201,8 @@ class Maga(asyncio.DatagramProtocol):
             }
         }, addr=addr)
 
-    async def handle_get_peers(self, infohash, addr):
-        await self.handler(infohash, addr)
-
-    async def handle_announce_peer(self, infohash, addr, peer_addr):
-        await self.handler(infohash, addr)
-
-    async def handler(self, infohash, addr):
+    async def _default_handler(self, infohash, peer_addr):
+        """
+        Default handler for discovered infohashes. Does nothing.
+        """
         pass

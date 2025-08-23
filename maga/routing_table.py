@@ -23,6 +23,10 @@ class KBucket:
     def get_all_nodes(self):
         return list(self.nodes.values())
 
+    def get_oldest_node(self):
+        # The first item in an OrderedDict is the oldest
+        return next(iter(self.nodes.values()), None)
+
     def __contains__(self, node_id):
         return self.min_id <= int.from_bytes(node_id, 'big') < self.max_id
 
@@ -48,21 +52,31 @@ class RoutingTable:
 
     def add_node(self, node):
         if node.node_id == self.node_id:
-            return
+            return "NO_ACTION", None
 
         bucket = self.get_bucket_for_node(node.node_id)
         if bucket.get_node(node.node_id):
             bucket.remove_node(node)
             bucket.add_node(node)
-            return
+            return "UPDATED", None
 
         if len(bucket) < constants.K:
             bucket.add_node(node)
-            return
+            return "ADDED", None
 
         if self.node_id in bucket:
             self.split_bucket(bucket)
-            self.add_node(node)
+            # The caller (DHTNode) is now responsible for re-adding the node
+            return "SPLIT", None
+        else:
+            # The bucket is full and we can't split it.
+            # Return the oldest node so the DHTNode can ping it.
+            return "FULL", bucket.get_oldest_node()
+
+    def remove_node(self, node):
+        bucket = self.get_bucket_for_node(node.node_id)
+        if bucket:
+            bucket.remove_node(node)
 
     def split_bucket(self, bucket):
         split_point = bucket.min_id + (bucket.max_id - bucket.min_id) // 2

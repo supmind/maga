@@ -97,6 +97,7 @@ class DHTNode(asyncio.DatagramProtocol):
         self.log = logging.getLogger(f"DHTNode:{self.port}")
         self.routing_table = RoutingTable(self.node_id)
         self.pending_lookups = {}
+        self.pending_pings = {}
         self.find_nodes_task = None
 
         resolved_bootstrap_nodes = []
@@ -156,11 +157,18 @@ class DHTNode(asyncio.DatagramProtocol):
 
     def handle_response(self, msg, addr):
         tid = msg.get(constants.KRPC_T)
+
+        if tid in self.pending_pings:
+            self.log.debug(f"Received PING response from {addr}")
+            self.pending_pings[tid].set_result(True)
+            return
+
         if tid in self.pending_lookups:
             lookup = self.pending_lookups[tid]
             sender_id = msg.get(constants.KRPC_R, {}).get(constants.KRPC_ID)
             if sender_id:
                 self.log.debug(f"Received response for lookup from {addr}")
+                asyncio.ensure_future(self.add_seen_node(sender_id, addr[0], addr[1]))
                 lookup.handle_response(sender_id, msg.get(constants.KRPC_R, {}))
             if lookup.future.done():
                 del self.pending_lookups[tid]
@@ -169,12 +177,12 @@ class DHTNode(asyncio.DatagramProtocol):
         args = msg.get(constants.KRPC_R, {})
         sender_id = args.get(constants.KRPC_ID)
         if sender_id:
-            self.add_seen_node(sender_id, addr[0], addr[1])
+            asyncio.ensure_future(self.add_seen_node(sender_id, addr[0], addr[1]))
 
         if constants.KRPC_NODES in args:
             self.log.debug(f"Received {len(args[constants.KRPC_NODES]) // 26} nodes from {addr}")
             for node_id, ip, port in utils.split_nodes(args[constants.KRPC_NODES]):
-                self.add_seen_node(node_id, ip, port)
+                asyncio.ensure_future(self.add_seen_node(node_id, ip, port))
 
     async def get_peers(self, infohash):
         self.log.info(f"Starting peer lookup for infohash: {infohash.hex()}")
@@ -206,7 +214,7 @@ class DHTNode(asyncio.DatagramProtocol):
         if not all([node_id, query_type]):
             return
 
-        self.add_seen_node(node_id, addr[0], addr[1])
+        asyncio.ensure_future(self.add_seen_node(node_id, addr[0], addr[1]))
 
         if query_type == constants.KRPC_PING:
             self.send_message({
@@ -252,19 +260,52 @@ class DHTNode(asyncio.DatagramProtocol):
                 }
             }, addr=addr)
 
-    def add_seen_node(self, node_id, ip, port):
-        if len(node_id) != 20:
-            return
-        if ip == '0.0.0.0' or port == 0:
-            return
-        # Avoid adding ourselves
-        if node_id == self.node_id:
+    async def add_seen_node(self, node_id, ip, port):
+        if len(node_id) != 20 or ip == '0.0.0.0' or port == 0 or node_id == self.node_id:
             return
 
         node = Node(node_id, ip, port)
-        if self.routing_table.add_node(node):
-            self.log.debug(f"Added node {node_id.hex()} from {ip}:{port}. "
-                           f"Routing table now has {len(self.routing_table.get_all_nodes())} nodes.")
+        status, oldest_node = self.routing_table.add_node(node)
+
+        if status == "ADDED":
+            self.log.debug(f"Added new node {node_id.hex()}. "
+                           f"Table size: {len(self.routing_table.get_all_nodes())}")
+        elif status == "UPDATED":
+            self.log.debug(f"Updated node {node_id.hex()}.")
+        elif status == "SPLIT":
+            self.log.debug("Routing table bucket was split. Re-adding node.")
+            await self.add_seen_node(node.node_id, node.ip, node.port)
+        elif status == "FULL":
+            self.log.debug(f"Bucket is full. Pinging oldest node {oldest_node.node_id.hex()}...")
+            if await self.ping(oldest_node):
+                self.log.debug(f"Oldest node {oldest_node.node_id.hex()} responded. Discarding new node.")
+                await self.add_seen_node(oldest_node.node_id, oldest_node.ip, oldest_node.port)
+            else:
+                self.log.info(f"Oldest node {oldest_node.node_id.hex()} did not respond. Replacing it.")
+                self.routing_table.remove_node(oldest_node)
+                await self.add_seen_node(node.node_id, node.ip, node.port)
+
+    async def ping(self, node, timeout=5):
+        tid = os.urandom(2)
+        while tid in self.pending_pings:
+            tid = os.urandom(2)
+
+        future = asyncio.Future(loop=self.loop)
+        self.pending_pings[tid] = future
+
+        self.send_message({
+            constants.KRPC_T: tid,
+            constants.KRPC_Y: constants.KRPC_QUERY,
+            constants.KRPC_Q: constants.KRPC_PING,
+            constants.KRPC_A: { constants.KRPC_ID: self.node_id }
+        }, (node.ip, node.port))
+
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            self.pending_pings.pop(tid, None)
 
     def find_node(self, addr, target=None):
         if not target:

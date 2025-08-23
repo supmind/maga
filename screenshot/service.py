@@ -180,28 +180,30 @@ class ScreenshotService:
     async def _alert_loop(self):
         while self._running:
             try:
-                if self.ses.wait_for_alert(1000):
-                    alerts = self.ses.pop_alerts()
-                    for alert in alerts:
-                        # If the alert is an error, log it as such.
-                        # Otherwise, log it as debug to avoid cluttering the logs.
-                        if alert.category() & lt.alert_category.error:
-                            self.log.error(f"Libtorrent Alert: {alert}")
-                        else:
-                            self.log.debug(f"Libtorrent Alert: {alert}")
+                # Poll for alerts non-blockingly
+                alerts = self.ses.pop_alerts()
+                for alert in alerts:
+                    # If the alert is an error, log it as such.
+                    # Otherwise, log it as debug to avoid cluttering the logs.
+                    if alert.category() & lt.alert_category.error:
+                        self.log.error(f"Libtorrent Alert: {alert}")
+                    else:
+                        self.log.debug(f"Libtorrent Alert: {alert}")
 
-                        # Handle specific alerts needed for logic
-                        if isinstance(alert, lt.metadata_received_alert):
-                            self._handle_metadata_received(alert)
-                        elif isinstance(alert, lt.piece_finished_alert):
-                            self._handle_piece_finished(alert)
-                        elif isinstance(alert, lt.dht_bootstrap_alert):
-                            self._handle_dht_bootstrap(alert)
-                        elif isinstance(alert, lt.dht_get_peers_reply_alert):
-                            self._handle_dht_get_peers_reply(alert)
-                        elif isinstance(alert, lt.tracker_reply_alert):
-                            self._handle_tracker_reply(alert)
-                await asyncio.sleep(0.1)
+                    # Handle specific alerts needed for logic
+                    if isinstance(alert, lt.metadata_received_alert):
+                        self._handle_metadata_received(alert)
+                    elif isinstance(alert, lt.piece_finished_alert):
+                        self._handle_piece_finished(alert)
+                    elif isinstance(alert, lt.dht_bootstrap_alert):
+                        self._handle_dht_bootstrap(alert)
+                    elif isinstance(alert, lt.dht_get_peers_reply_alert):
+                        self._handle_dht_get_peers_reply(alert)
+                    elif isinstance(alert, lt.tracker_reply_alert):
+                        self._handle_tracker_reply(alert)
+
+                # Sleep to yield control to the event loop
+                await asyncio.sleep(0.5)
             except asyncio.CancelledError:
                 break
             except Exception:

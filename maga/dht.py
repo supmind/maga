@@ -323,11 +323,14 @@ class DHTNode(asyncio.DatagramProtocol):
     async def auto_find_nodes(self):
         self.__running = True
         while self.__running:
-            # Find a random node to keep the table fresh
-            self.find_node(
-                self.bootstrap_nodes[0], target=utils.random_node_id()
-            )
-            await asyncio.sleep(self.interval)
+            try:
+                # Find a random node to keep the table fresh
+                self.find_node(
+                    self.bootstrap_nodes[0], target=utils.random_node_id()
+                )
+                await asyncio.sleep(self.interval)
+            except Exception:
+                self.log.exception("Error in DHTNode auto_find_nodes loop")
 
     async def run(self):
         await self.loop.create_datagram_endpoint(

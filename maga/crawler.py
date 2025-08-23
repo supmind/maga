@@ -10,6 +10,7 @@ from socket import inet_ntoa
 from struct import unpack
 
 import bencode2 as bencoder
+import logging
 
 from . import utils
 from . import constants
@@ -24,6 +25,7 @@ class Maga(asyncio.DatagramProtocol):
         self.transport = None
         self.loop = loop or asyncio.get_event_loop()
         self.handler = handler or self._default_handler
+        self.log = logging.getLogger("Crawler")
 
         resolved_bootstrap_nodes = []
         for host, port in bootstrap_nodes:
@@ -89,9 +91,12 @@ class Maga(asyncio.DatagramProtocol):
     async def auto_find_nodes(self):
         self.__running = True
         while self.__running:
-            await asyncio.sleep(self.interval)
-            for node in self.bootstrap_nodes:
-                self.find_node(addr=node)
+            try:
+                await asyncio.sleep(self.interval)
+                for node in self.bootstrap_nodes:
+                    self.find_node(addr=node)
+            except Exception:
+                self.log.exception("Error in Crawler auto_find_nodes loop")
 
     async def run(self, port=6881):
         _, _ = await self.loop.create_datagram_endpoint(

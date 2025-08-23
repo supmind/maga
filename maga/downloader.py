@@ -162,6 +162,7 @@ class Downloader:
         self.dht_port = dht_port
         self.dht_node = DHTNode(loop=self.loop, port=self.dht_port)
         self.download_queue = asyncio.Queue()
+        self.results_queue = asyncio.Queue()
         self.num_workers = num_workers
         self.workers = []
         self._running = False
@@ -204,7 +205,8 @@ class Downloader:
                         if metadata:
                             info = metadata.get(b'info', {})
                             file_name = info.get(b'name', b'Unknown').decode(errors='ignore')
-                            print(f"[Worker] SUCCESS: Downloaded metadata for '{file_name}' ({infohash_hex})")
+                            self.log.info(f"Successfully downloaded metadata for '{file_name}' ({infohash_hex})")
+                            await self.results_queue.put((infohash, metadata))
                             break
                     except Exception:
                         continue

@@ -83,6 +83,9 @@ class ScreenshotService:
     def _handle_dht_get_peers_reply(self, alert):
         self.log.info(f"Received DHT peers reply for {alert.info_hash}. Found {len(alert.peers)} peers.")
 
+    def _handle_tracker_reply(self, alert):
+        self.log.info(f"Received tracker reply for {alert.handle.info_hash()}. Found {alert.num_peers} peers.")
+
     async def _alert_loop(self):
         while self._running:
             try:
@@ -98,6 +101,8 @@ class ScreenshotService:
                             self._handle_dht_bootstrap(alert)
                         elif isinstance(alert, lt.dht_get_peers_reply_alert):
                             self._handle_dht_get_peers_reply(alert)
+                        elif isinstance(alert, lt.tracker_reply_alert):
+                            self._handle_tracker_reply(alert)
                 await asyncio.sleep(0.1)
             except asyncio.CancelledError:
                 break
@@ -130,7 +135,17 @@ class ScreenshotService:
             # 1. Add torrent and wait for metadata
             future = self.loop.create_future()
             self.pending_metadata[str(infohash_bytes)] = future
-            params = {'info_hash': infohash_bytes, 'save_path': save_dir}
+
+            trackers = [
+                "udp://tracker.openbittorrent.com:80",
+                "udp://tracker.opentrackr.org:1337/announce",
+                "udp://tracker.coppersurfer.tk:6969/announce"
+            ]
+            params = {
+                'info_hash': infohash_bytes,
+                'save_path': save_dir,
+                'trackers': trackers
+            }
             handle = self.ses.add_torrent(params)
 
             self.log.debug(f"Added torrent for {infohash_hex}, waiting for metadata...")

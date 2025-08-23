@@ -1,3 +1,6 @@
+# For torrenting
+libtorrent
 bencode2
-uvloop
+
+# For video processing
 av

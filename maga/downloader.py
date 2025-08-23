@@ -1,164 +1,112 @@
-import hashlib
 import asyncio
 import binascii
 import struct
-import math
-
-import bencode2 as bencoder
 from . import utils
 
+BT_PROTOCOL = "BitTorrent protocol"
+BT_HEADER = b'\x13' + BT_PROTOCOL.encode('utf-8') + b'\x00\x00\x00\x00\x00\x00\x00\x00'
 
 class MessageType:
-    REQUEST = 0
-    DATA = 1
-    REJECT = 2
+    CHOKE = 0
+    UNCHOKE = 1
+    INTERESTED = 2
+    NOT_INTERESTED = 3
+    HAVE = 4
+    BITFIELD = 5
+    REQUEST = 6
+    PIECE = 7
+    CANCEL = 8
+    PORT = 9
 
+BLOCK_SIZE = 16384  # 16KB
 
-BT_PROTOCOL = "BitTorrent protocol"
-BT_PROTOCOL_LEN = len(BT_PROTOCOL)
-EXT_ID = 20
-EXT_HANDSHAKE_ID = 0
-EXT_HANDSHAKE_MESSAGE = bytes([EXT_ID, EXT_HANDSHAKE_ID]) + bencoder.bencode({"m": {"ut_metadata": 1}})
-
-BLOCK = math.pow(2, 14)
-MAX_SIZE = BLOCK * 1000
-BT_HEADER = b'\x13BitTorrent protocol\x00\x00\x00\x00\x00\x10\x00\x01'
-
-
-def get_ut_metadata(data):
-    ut_metadata = b"ut_metadata"
-    index = data.index(ut_metadata)+len(ut_metadata) + 1
-    data = data[index:]
-    return int(data[:data.index(b'e')])
-
-
-def get_metadata_size(data):
-    metadata_size = b"metadata_size"
-    start = data.index(metadata_size) + len(metadata_size) + 1
-    data = data[start:]
-    return int(data[:data.index(b"e")])
-
-
-class WirePeerClient:
-    def __init__(self, infohash, loop=None):
+class TorrentDownloader:
+    def __init__(self, infohash, peer_ip, peer_port, metadata, result_dict, loop=None):
         if isinstance(infohash, str):
             infohash = binascii.unhexlify(infohash.upper())
         self.infohash = infohash
         self.peer_id = utils.random_node_id()
+        self.peer_ip = peer_ip
+        self.peer_port = peer_port
+        self.metadata = metadata
+        self.result_dict = result_dict
         self.loop = loop or asyncio.get_event_loop()
 
-        self.writer = None
         self.reader = None
+        self.writer = None
+        self.peer_has_pieces = None
+        self.am_choking = True
+        self.am_interested = False
+        self.peer_choking = True
+        self.peer_interested = False
 
-        self.ut_metadata = 0
-        self.metadata_size = 0
-        self.handshaked = False
-        self.pieces_num = 0
-        self.pieces_received_num = 0
-        self.pieces = None
+        self.piece_length = self.metadata[b'piece length']
+        self.pieces = self.metadata[b'pieces']
+        self.num_pieces = len(self.pieces) // 20
+        self.downloaded_pieces = {} # piece_index -> piece_data
 
-    async def connect(self, ip, port):
-        self.reader, self.writer = await asyncio.open_connection(
-            ip, port
-        )
+    async def connect(self):
+        self.reader, self.writer = await asyncio.open_connection(self.peer_ip, self.peer_port)
 
     def close(self):
-        try:
+        if self.writer:
             self.writer.close()
-        except:
-            pass
 
-    def check_handshake(self, data):
-        # Check BT Protocol Prefix
+    async def do_handshake(self):
+        self.writer.write(BT_HEADER + self.infohash + self.peer_id)
+        data = await self.reader.readexactly(68)
         if data[:20] != BT_HEADER[:20]:
-            return False
-        # Check InfoHash
+            raise Exception("Invalid BT protocol header")
         if data[28:48] != self.infohash:
-            return False
-        # Check support metadata exchange
-        if data[25] & 0x10 != 0x10:
-            return False
+            raise Exception("Invalid infohash")
         return True
 
-    def write_message(self, message):
-        length = struct.pack(">I", len(message))
-        self.writer.write(length + message)
+    def send_message(self, msg_type, payload=b''):
+        msg = struct.pack('!IB', 1 + len(payload), msg_type) + payload
+        self.writer.write(msg)
 
-    def request_piece(self, piece):
-        msg = bytes([EXT_ID, self.ut_metadata]) + bencoder.bencode({"msg_type": 0, "piece": piece})
-        self.write_message(msg)
+    async def message_loop(self):
+        while len(self.downloaded_pieces) < self.num_pieces:
+            data = await self.reader.readexactly(4)
+            msg_len = struct.unpack('!I', data)[0]
 
-    def pieces_complete(self):
-        metainfo = b''.join(self.pieces)
-
-        if len(metainfo) != self.metadata_size:
-            # Wrong size
-            return self.close()
-
-        infohash = hashlib.sha1(metainfo).hexdigest()
-        if binascii.unhexlify(infohash.upper()) != self.infohash:
-            # Wrong infohash
-            return self.close()
-
-        return bencoder.bdecode(metainfo)
-
-    async def work(self):
-        self.writer.write(BT_HEADER + self.infohash + self.peer_id)
-        while True:
-            if not self.handshaked:
-                data = await self.reader.readexactly(68)
-                if self.check_handshake(data):
-                    self.handshaked = True
-                    # Send EXT Handshake
-                    self.write_message(EXT_HANDSHAKE_MESSAGE)
-                else:
-                    return self.close()
-
-            total_message_length, msg_id = struct.unpack("!IB", await self.reader.readexactly(5))
-            # Total message length contains message id length, remove it
-            payload_length = total_message_length - 1
-            payload = await self.reader.readexactly(payload_length)
-
-            if msg_id != EXT_ID:
-                continue
-            extended_id, extend_payload = payload[0], payload[1:]
-            if extended_id == 0 and not self.ut_metadata:
-                # Extend handshake, receive ut_metadata and metadata_size
-                try:
-                    self.ut_metadata = get_ut_metadata(extend_payload)
-                    self.metadata_size = get_metadata_size(extend_payload)
-                except:
-                    return self.close()
-                self.pieces_num = math.ceil(self.metadata_size / BLOCK)
-                self.pieces = [False] * self.pieces_num
-                self.request_piece(0)
+            if msg_len == 0:
                 continue
 
-            try:
-                split_index = extend_payload.index(b"ee")+2
-                info = bencoder.bdecode(extend_payload[:split_index])
-                if info[b'msg_type'] != MessageType.DATA:
-                    return self.close()
-                if info[b'piece'] != self.pieces_received_num:
-                    return self.close()
-                self.pieces[info[b'piece']] = extend_payload[split_index:]
-            except:
-                return self.close()
-            self.pieces_received_num += 1
-            if self.pieces_received_num == self.pieces_num:
-                return self.pieces_complete()
-            else:
-                self.request_piece(self.pieces_received_num)
+            data = await self.reader.readexactly(msg_len)
+            msg_id = data[0]
+            payload = data[1:]
 
+            if msg_id == MessageType.BITFIELD:
+                self.peer_has_pieces = list(bin(int.from_bytes(payload, 'big'))[2:])
+                self.send_message(MessageType.INTERESTED)
+            elif msg_id == MessageType.UNCHOKE:
+                self.peer_choking = False
+                await self.request_pieces()
+            elif msg_id == MessageType.PIECE:
+                piece_index, block_offset = struct.unpack('!II', payload[:8])
+                block_data = payload[8:]
 
-async def get_metadata(infohash, ip, port, loop=None):
-    if not loop:
-        loop = asyncio.get_event_loop()
+                if piece_index not in self.downloaded_pieces:
+                    self.downloaded_pieces[piece_index] = b''
+                self.downloaded_pieces[piece_index] += block_data
 
-    client = WirePeerClient(infohash, loop=loop)
-    try:
-        await client.connect(ip, port)
-        return await asyncio.wait_for(client.work(), timeout=5)
-    except Exception as e:
-        client.close()
-        return False
+                if len(self.downloaded_pieces[piece_index]) == self.piece_length:
+                    key = ('piece', self.infohash.hex().upper(), piece_index)
+                    self.result_dict[key] = self.downloaded_pieces[piece_index]
+                    print(f"Got piece {piece_index}")
+
+    async def request_pieces(self):
+        for i in range(self.num_pieces):
+            for block_offset in range(0, self.piece_length, BLOCK_SIZE):
+                block_length = min(BLOCK_SIZE, self.piece_length - block_offset)
+                payload = struct.pack('!III', i, block_offset, block_length)
+                self.send_message(MessageType.REQUEST, payload)
+
+    async def download(self):
+        try:
+            await self.connect()
+            await self.do_handshake()
+            await self.message_loop()
+        finally:
+            self.close()

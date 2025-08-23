@@ -8,7 +8,8 @@ import multiprocessing
 import signal
 from queue import Empty
 
-from maga import Maga, get_metadata
+from maga import Maga
+from maga.metadata import get_metadata
 # We do NOT import DownloaderService here in the main process
 # from screenshot_system.download_service import DownloaderService
 from screenshot_system.orchestrator import create_screenshots_from_stream
@@ -33,7 +34,7 @@ def classify_torrent(name):
     return None
 # --- End of Classification System ---
 
-def run_screenshot_task(infohash: str, metadata: dict, target_file_index: int, file_size: int, stats_queue, request_queue, result_dict):
+def run_screenshot_task(infohash: str, metadata: dict, target_file_index: int, file_size: int, peer_addr: tuple, stats_queue, request_queue, result_dict):
     """
     The main function for the screenshot worker process.
     """
@@ -41,7 +42,7 @@ def run_screenshot_task(infohash: str, metadata: dict, target_file_index: int, f
     print(f"[Worker:{worker_id}] Started for {infohash}")
     try:
         print(f"[Worker:{worker_id}] Sending 'add_torrent' request to service...")
-        request_queue.put(('add_torrent', (infohash, metadata)))
+        request_queue.put(('add_torrent', (infohash, metadata, [peer_addr])))
         print(f"[Worker:{worker_id}] Request sent. Initializing IO adapter...")
 
         io_adapter = TorrentFileIO(infohash, metadata, target_file_index, file_size, request_queue, result_dict)
@@ -124,6 +125,7 @@ class Crawler(Maga):
                 metadata,
                 target_file_index,
                 largest_size,
+                peer_addr,
                 self.stats_queue,
                 self.request_queue,
                 self.result_dict
@@ -144,14 +146,17 @@ if __name__ == "__main__":
     stats_thread = threading.Thread(target=statistics_worker, args=(stats_queue,), daemon=True)
     stats_thread.start()
 
-    print("[Main] Starting Downloader Service...")
+    print("[Main] Preparing to start Downloader Service...")
     downloader_process = multiprocessing.Process(
         target=downloader_service_bootstrap,
         args=(download_request_queue, download_result_dict),
         daemon=True
     )
+    print("[Main] Starting Downloader Service...")
     downloader_process.start()
+    print("[Main] Downloader Service started.")
 
+    print("[Main] Initializing Crawler...")
     crawler = Crawler(stats_queue, download_request_queue, download_result_dict)
 
     def shutdown_handler(signum, frame):

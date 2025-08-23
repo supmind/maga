@@ -171,6 +171,14 @@ class ScreenshotService:
                 if not pieces_to_wait_for:
                     future.set_result(True)
 
+    def _handle_torrent_finished(self, alert):
+        infohash_str = str(alert.handle.info_hash())
+        if infohash_str in self.pending_pieces:
+            future, _ = self.pending_pieces[infohash_str]
+            if not future.done():
+                self.log.debug(f"Torrent {infohash_str} finished, resolving pending piece future.")
+                future.set_result(True)
+
     def _handle_dht_bootstrap(self, alert):
         if not self.dht_ready.is_set():
             self.dht_ready.set()
@@ -200,6 +208,8 @@ class ScreenshotService:
                         self._handle_metadata_received(alert)
                     elif isinstance(alert, lt.piece_finished_alert):
                         self._handle_piece_finished(alert)
+                    elif isinstance(alert, lt.torrent_finished_alert):
+                        self._handle_torrent_finished(alert)
                     elif isinstance(alert, lt.dht_bootstrap_alert):
                         self._handle_dht_bootstrap(alert)
                     elif isinstance(alert, lt.dht_get_peers_reply_alert):

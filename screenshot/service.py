@@ -403,23 +403,21 @@ class ScreenshotService:
             future.result(timeout=180) # Block this thread waiting for the result
             self.log.info("Keyframe data downloaded.")
 
-            # 6. Take screenshot
-            self.log.debug("Opening final container for screenshot...")
-            final_reader = TorrentFileReader(self, handle, video_file_index)
-            with av.open(final_reader) as final_container:
-                # The `seek` method in PyAV does not support `whence='byte'`.
-                # Instead, we must demux from the beginning and find our packet by its byte position.
-                for p in final_container.demux(video=0):
-                    if p.pos == packet.pos:
-                        frames = p.decode()
-                        if frames:
-                            frame = frames[0]
-                            output_dir = "/tmp/screenshots"
-                            output_filename = f"{output_dir}/{infohash_hex}_{timestamp.replace(':', '-')}.jpg"
-                            os.makedirs(output_dir, exist_ok=True)
-                            frame.to_image().save(output_filename)
-                            self.log.info(f"SUCCESS: Screenshot saved to {output_filename}")
-                        break  # We found and processed our packet, so we can stop.
+            # 6. Take screenshot by re-seeking and decoding in the same container
+            self.log.debug("Re-seeking to keyframe to decode...")
+            container.seek(packet.pts, stream=stream)
+
+            # Decode frames until we get the one at or after our target packet's timestamp
+            for frame in container.decode(video=0):
+                if frame.pts >= packet.pts:
+                    output_dir = "/tmp/screenshots"
+                    output_filename = f"{output_dir}/{infohash_hex}_{timestamp.replace(':', '-')}.jpg"
+                    os.makedirs(output_dir, exist_ok=True)
+                    frame.to_image().save(output_filename)
+                    self.log.info(f"SUCCESS: Screenshot saved to {output_filename}")
+                    return # Exit the function successfully
+
+            raise RuntimeError("Failed to decode frame after re-seeking.")
 
     async def _worker(self):
         while self._running:

@@ -1,37 +1,55 @@
 import asyncio
-from maga.crawler import Maga
+import signal
 
-async def print_stats(crawler):
+from maga.crawler import Maga
+from maga.dht import DHTNode
+
+async def print_stats(dht_node):
     """
-    Prints the number of nodes in the routing table every 10 seconds.
+    Prints the number of nodes in the DHTNode's routing table every 10 seconds.
     """
     while True:
-        # Wait a bit for the crawler to start finding nodes
         await asyncio.sleep(10)
-        print(f"[Stats] Nodes in routing table: {len(crawler.routing_table.get_all_nodes())}")
-
+        print(f"[Stats] DHT Node knows {len(dht_node.routing_table.get_all_nodes())} nodes.")
         # You can also print bucket information for more detail
-        # for i, bucket in enumerate(crawler.routing_table.buckets):
+        # for i, bucket in enumerate(dht_node.routing_table.buckets):
         #     print(f"  Bucket {i}: {len(bucket)} nodes")
 
-if __name__ == "__main__":
-    print("Starting DHT crawler...")
-    print("Press Ctrl+C to stop.")
 
-    loop = asyncio.get_event_loop()
+async def main():
+    loop = asyncio.get_running_loop()
+
+    # Create instances of the crawler and the DHT node
     crawler = Maga(loop=loop)
+    dht_node = DHTNode(loop=loop)
 
-    # Schedule the stats printer to run in the background
-    asyncio.ensure_future(print_stats(crawler), loop=loop)
+    # Start the services on different ports
+    await crawler.run(port=6881)
+    print("Lightweight crawler started on port 6881.")
 
+    await dht_node.run(port=6882)
+    print("DHT node for downloader started on port 6882.")
+
+    # Start the stats printer
+    stats_task = loop.create_task(print_stats(dht_node))
+
+    print("\nRunning both services. Press Ctrl+C to stop.")
+
+    # Wait for Ctrl+C
+    stop = asyncio.Future()
+    loop.add_signal_handler(signal.SIGINT, stop.set_result, None)
+    await stop
+
+    # Clean up
+    print("\nStopping services...")
+    stats_task.cancel()
+    crawler.stop()
+    dht_node.stop()
+    print("Services stopped.")
+
+
+if __name__ == "__main__":
     try:
-        # This call will block and run the event loop, executing all scheduled tasks.
-        crawler.run()
+        asyncio.run(main())
     except KeyboardInterrupt:
         pass
-    finally:
-        print("\nCrawler stopping...")
-        # The stop() method is already called by the signal handler inside run(),
-        # but we can call it here just in case. The loop is also stopped
-        # and closed inside the crawler's run/stop methods.
-        crawler.stop()

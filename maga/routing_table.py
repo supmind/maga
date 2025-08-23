@@ -1,4 +1,3 @@
-import bisect
 from collections import OrderedDict
 
 from . import constants
@@ -31,7 +30,7 @@ class KBucket:
         return len(self.nodes)
 
     def __repr__(self):
-        return f"<KBucket(min={self.min_id.hex()}, max={self.max_id.hex()})>"
+        return f"<KBucket(min=0x{self.min_id.hex()}, max=0x{self.max_id.hex()})>"
 
 
 class RoutingTable:
@@ -45,7 +44,6 @@ class RoutingTable:
         for bucket in self.buckets:
             if node_id in bucket:
                 return bucket
-        # This should not happen
         return None
 
     def add_node(self, node):
@@ -53,8 +51,6 @@ class RoutingTable:
             return
 
         bucket = self.get_bucket_for_node(node.node_id)
-
-        # If node is already in the bucket, update it (move to end)
         if bucket.get_node(node.node_id):
             bucket.remove_node(node)
             bucket.add_node(node)
@@ -64,17 +60,9 @@ class RoutingTable:
             bucket.add_node(node)
             return
 
-        # If the bucket is full, we may need to split it
         if self.node_id in bucket:
             self.split_bucket(bucket)
-            # After splitting, try to add the node again
             self.add_node(node)
-        else:
-            # If our own node is not in this bucket, we can't split it.
-            # The bucket is full. We can either ping the oldest node to
-            # see if it's still alive, or just discard the new node.
-            # For now, we'll just discard it.
-            pass
 
     def split_bucket(self, bucket):
         split_point = bucket.min_id + (bucket.max_id - bucket.min_id) // 2
@@ -82,11 +70,9 @@ class RoutingTable:
         new_bucket = KBucket(split_point, bucket.max_id)
         bucket.max_id = split_point
 
-        # Find the index of the bucket to split
         idx = self.buckets.index(bucket)
         self.buckets.insert(idx + 1, new_bucket)
 
-        # Redistribute nodes
         nodes_to_move = [
             node for node in bucket.get_all_nodes() if node.node_id >= split_point
         ]

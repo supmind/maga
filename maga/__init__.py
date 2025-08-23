@@ -1,3 +1,4 @@
 from .crawler import Maga
-from .crawler import __version__
-from .downloader import get_metadata
+from .downloader import Downloader
+
+__version__ = '3.1.0'

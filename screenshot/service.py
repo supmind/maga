@@ -92,10 +92,10 @@ class ScreenshotService:
                 if self.ses.wait_for_alert(1000):
                     alerts = self.ses.pop_alerts()
                     for alert in alerts:
-                        # Log ALL alerts at INFO level for maximum visibility
-                        self.log.info(f"Libtorrent Alert: {alert}")
+                        # Log all alerts at DEBUG level
+                        self.log.debug(f"Libtorrent Alert: {alert}")
 
-                        # Also handle specific alerts needed for logic
+                        # Handle specific alerts needed for logic
                         if isinstance(alert, lt.metadata_received_alert):
                             self._handle_metadata_received(alert)
                         elif isinstance(alert, lt.piece_finished_alert):

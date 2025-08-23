@@ -10,8 +10,8 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-# Set our service's logger to DEBUG to see more details if needed
-# logging.getLogger("ScreenshotService").setLevel(logging.DEBUG)
+# 设置服务日志级别为 DEBUG，以输出更详细的信息
+logging.getLogger("ScreenshotService").setLevel(logging.DEBUG)
 
 
 async def main():
@@ -39,10 +39,17 @@ async def main():
     print("Screenshots will be saved in the 'screenshots/' directory.")
     print("Press Ctrl+C to stop the service.")
 
-    # Wait for graceful shutdown
+    # Wait for graceful shutdown or timeout
     stop = asyncio.Future()
     loop.add_signal_handler(signal.SIGINT, stop.set_result, None)
-    await stop
+
+    timeout = 300  # seconds
+    print(f"Running for a maximum of {timeout} seconds. Will stop automatically.")
+
+    try:
+        await asyncio.wait_for(stop, timeout=timeout)
+    except asyncio.TimeoutError:
+        print(f"\nTimeout reached after {timeout} seconds.")
 
     # Clean up
     print("\nStopping service...")
@@ -51,7 +58,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())

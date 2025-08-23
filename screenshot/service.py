@@ -2,9 +2,100 @@ import asyncio
 import logging
 import binascii
 import os
+import io
 import av
 import libtorrent as lt
 
+# ==============================================================================
+# TorrentFileReader: A file-like object for reading from a torrent
+# ==============================================================================
+class TorrentFileReader(io.RawIOBase):
+    """
+    一个“稀疏”的、只读的、可seek的文件类对象，用于从libtorrent中读取数据。
+    它模拟一个完整的文件，允许PyAV等库直接从torrent数据流中读取，而无需先将整个文件下载到磁盘。
+    当读取尚未下载的数据片段时，它会返回零字节。
+    """
+    def __init__(self, handle, file_index):
+        super().__init__()
+        self.handle = handle
+        self.ti = handle.get_torrent_info()
+        self.file_storage = self.ti.files()
+        self.file_index = file_index
+
+        self.file_entry = self.file_storage.at(self.file_index)
+        self.file_size = self.file_entry.size
+        self.pos = 0
+
+        self.log = logging.getLogger("TorrentFileReader")
+        # self.log.setLevel(logging.DEBUG)
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        if whence == io.SEEK_SET:
+            self.pos = offset
+        elif whence == io.SEEK_CUR:
+            self.pos += offset
+        elif whence == io.SEEK_END:
+            self.pos = self.file_size + offset
+
+        self.log.debug(f"Seek to {self.pos} (whence={whence}, offset={offset})")
+        return self.pos
+
+    def tell(self):
+        return self.pos
+
+    def read(self, size=-1):
+        if size == -1:
+            size = self.file_size - self.pos
+
+        size = min(size, self.file_size - self.pos)
+        if size <= 0:
+            return b''
+
+        self.log.debug(f"Reading {size} bytes from position {self.pos}")
+
+        # 将文件级别的read请求，映射到torrent的piece级别
+        file_map = self.ti.map_file(self.file_index, self.pos, size)
+
+        result_buffer = bytearray(size)
+        buffer_offset = 0
+
+        for file_slice in file_map.file_slices:
+            piece_index = file_slice.piece_index
+            piece_offset = file_slice.start
+            slice_size = file_slice.size
+
+            data_to_read = min(slice_size, size - buffer_offset)
+
+            if self.handle.have_piece(piece_index):
+                # 如果我们有这个piece，就去读取它
+                piece_data = self.handle.read_piece(piece_index)
+
+                # 从piece中提取我们需要的部分
+                start = piece_offset
+                end = start + data_to_read
+                chunk = piece_data[start:end]
+
+                result_buffer[buffer_offset : buffer_offset + len(chunk)] = chunk
+                self.log.debug(f"Read {len(chunk)} bytes from downloaded piece {piece_index}")
+            else:
+                # 如果没有这个piece，就用零字节填充
+                self.log.debug(f"Returning {data_to_read} zero bytes for missing piece {piece_index}")
+                # bytearray is already initialized to zeros, so we just skip
+
+            buffer_offset += data_to_read
+
+        self.pos += size
+        return bytes(result_buffer)
+
+# ==============================================================================
+# ScreenshotService
+# ==============================================================================
 class ScreenshotService:
     def __init__(self, loop=None, num_workers=10):
         self.loop = loop or asyncio.get_event_loop()
@@ -165,31 +256,46 @@ class ScreenshotService:
                 self.log.warning(f"No video file found in torrent {infohash_hex}")
                 return
 
-            video_path = os.path.join(save_dir, target_file.path)
-            self.log.info(f"Identified target video file: {video_path} (size: {target_file.size})")
+            self.log.info(f"Identified target video file: {target_file.path} (size: {target_file.size})")
 
             # 3. Prioritize and download file header
             piece_size = ti.piece_length()
-            header_size_to_download = 4 * 1024 * 1024
-            head_pieces = {p.piece for p in ti.map_file(video_file_index, 0, header_size_to_download).file_slices}
+            # Let's download a bit more for the header to be safe with various video formats
+            header_size_to_download = 5 * 1024 * 1024
+            # Ensure we don't try to download more than the file size
+            header_size_to_download = min(header_size_to_download, target_file.size)
 
-            handle.set_piece_deadline(list(head_pieces)[0], 1000)
+            file_map = ti.map_file(video_file_index, 0, header_size_to_download)
+            head_pieces = {p.piece for p in file_map.file_slices}
+
+            if not head_pieces:
+                self.log.warning(f"No header pieces to download for {target_file.path}. The file might be empty.")
+                return
+
             for p in head_pieces:
                 handle.piece_priority(p, lt.download_priority.top_priority)
 
             self.log.info(f"Downloading header for {target_file.path} ({len(head_pieces)} pieces)...")
-            await self._wait_for_pieces(infohash_bytes, handle, head_pieces)
+            await self._wait_for_pieces(infohash_bytes, handle, head_pieces.copy())
             self.log.info(f"Header for {target_file.path} downloaded.")
 
-            # 4. Use PyAV to find the target keyframe
-            with av.open(video_path) as container:
+            # 4. Use PyAV with our custom file-like object to find the target keyframe
+            # PyAV需要一个可seek的对象，但我们只下载了部分文件。
+            # 因此我们创建一个“稀疏文件”读取器，它模拟一个完整的文件。
+            # 读取已下载的部分时，它返回真实数据；读取未下载的部分时，它返回零。
+            torrent_reader = TorrentFileReader(handle, video_file_index)
+
+            with av.open(torrent_reader) as container:
                 target_seconds = sum(int(x) * 60 ** i for i, x in enumerate(reversed(timestamp.split(':'))))
                 stream = container.streams.video[0]
 
-                target_pts = target_seconds / stream.time_base
+                # PyAV will seek and read from our TorrentFileReader to find the keyframe
+                container.seek(int(target_seconds * 1000000), backward=True, any_frame=False, stream=stream)
+
                 packet = None
-                container.seek(int(target_pts), backward=True, any_frame=False, stream=stream)
                 for p in container.demux(stream):
+                    if p.dts is None:  # Skip packets without a timestamp
+                        continue
                     if p.is_keyframe:
                         packet = p
                         break
@@ -200,26 +306,41 @@ class ScreenshotService:
                 self.log.info(f"Found keyframe at {packet.pts * stream.time_base:.2f}s for target {timestamp}")
 
                 # 5. Prioritize and download pieces for the keyframe
-                keyframe_pieces_map = ti.map_file(video_file_index, packet.pos, packet.size)
-                keyframe_pieces = {p.piece for p in keyframe_pieces_map.file_slices}
+                # The packet.pos gives the byte offset of the keyframe in the file
+                keyframe_pos = packet.pos
+                keyframe_size = packet.size
+
+                keyframe_map = ti.map_file(video_file_index, keyframe_pos, keyframe_size)
+                keyframe_pieces = {p.piece for p in keyframe_map.file_slices}
 
                 for p in keyframe_pieces:
                     handle.piece_priority(p, lt.download_priority.top_priority)
 
-                self.log.info(f"Downloading keyframe data ({len(keyframe_pieces)} pieces)...")
-                await self._wait_for_pieces(infohash_bytes, handle, keyframe_pieces)
+                self.log.info(f"Downloading keyframe data ({len(keyframe_pieces)} pieces from position {keyframe_pos})...")
+                await self._wait_for_pieces(infohash_bytes, handle, keyframe_pieces.copy())
                 self.log.info("Keyframe data downloaded.")
 
                 # 6. Take screenshot
-                container.seek(packet.pts, stream=stream)
-                frame = next(container.decode(stream), None)
-                if frame:
-                    output_filename = f"./screenshots/{infohash_hex}_{timestamp.replace(':', '-')}.jpg"
-                    os.makedirs("./screenshots", exist_ok=True)
-                    frame.to_image().save(output_filename)
-                    self.log.info(f"SUCCESS: Screenshot saved to {output_filename}")
-                else:
-                    raise RuntimeError("Failed to decode frame after downloading pieces.")
+                # We need to re-open the reader or seek back to the keyframe packet
+                # A new instance of the reader is cleaner
+                final_reader = TorrentFileReader(handle, video_file_index)
+                with av.open(final_reader) as final_container:
+                    final_stream = final_container.streams.video[0]
+                    # Seek directly to the keyframe packet's position
+                    final_container.seek(packet.pts, stream=final_stream)
+
+                    frame = None
+                    for decoded_frame in final_container.decode(final_stream):
+                        frame = decoded_frame
+                        break # Decode only the first frame found at this position
+
+                    if frame:
+                        output_filename = f"./screenshots/{infohash_hex}_{timestamp.replace(':', '-')}.jpg"
+                        os.makedirs("./screenshots", exist_ok=True)
+                        frame.to_image().save(output_filename)
+                        self.log.info(f"SUCCESS: Screenshot saved to {output_filename}")
+                    else:
+                        raise RuntimeError("Failed to decode frame after downloading keyframe pieces.")
 
         except asyncio.TimeoutError:
             self.log.error(f"Timeout during screenshot task for {infohash_hex}")

@@ -8,12 +8,13 @@ from maga.downloader import Downloader
 
 # 配置日志记录器
 logging.basicConfig(
-    level=logging.INFO,
+    # 设置根记录器的级别为DEBUG，这样所有级别的日志都会被处理
+    level=logging.DEBUG,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-# 将我们自己的下载器日志级别设为DEBUG，以获取更详细的输出
-logging.getLogger("DHTNode").setLevel(logging.DEBUG)
+# (可选) 如果想减少其他库（如uvloop）的日志，可以单独提高它们的级别
+# logging.getLogger("uvloop").setLevel(logging.WARNING)
 
 
 # 使用一个集合（set）来记录已经提交给下载器的infohash

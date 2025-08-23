@@ -335,8 +335,9 @@ class ScreenshotService:
                         break # Decode only the first frame found at this position
 
                     if frame:
-                        output_filename = f"./screenshots/{infohash_hex}_{timestamp.replace(':', '-')}.jpg"
-                        os.makedirs("./screenshots", exist_ok=True)
+                        output_dir = "/tmp/screenshots"
+                        output_filename = f"{output_dir}/{infohash_hex}_{timestamp.replace(':', '-')}.jpg"
+                        os.makedirs(output_dir, exist_ok=True)
                         frame.to_image().save(output_filename)
                         self.log.info(f"SUCCESS: Screenshot saved to {output_filename}")
                     else:

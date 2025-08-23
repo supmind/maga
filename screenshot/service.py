@@ -80,6 +80,9 @@ class ScreenshotService:
             self.dht_ready.set()
             self.log.info("DHT bootstrapped. Service is ready to process tasks.")
 
+    def _handle_dht_get_peers_reply(self, alert):
+        self.log.info(f"Received DHT peers reply for {alert.info_hash}. Found {len(alert.peers)} peers.")
+
     async def _alert_loop(self):
         while self._running:
             try:
@@ -93,6 +96,8 @@ class ScreenshotService:
                             self._handle_piece_finished(alert)
                         elif isinstance(alert, lt.dht_bootstrap_alert):
                             self._handle_dht_bootstrap(alert)
+                        elif isinstance(alert, lt.dht_get_peers_reply_alert):
+                            self._handle_dht_get_peers_reply(alert)
                 await asyncio.sleep(0.1)
             except asyncio.CancelledError:
                 break
@@ -129,7 +134,7 @@ class ScreenshotService:
             handle = self.ses.add_torrent(params)
 
             self.log.debug(f"Added torrent for {infohash_hex}, waiting for metadata...")
-            await asyncio.wait_for(future, timeout=60)
+            await asyncio.wait_for(future, timeout=180) # Increased timeout
             self.log.info(f"Successfully received metadata for {infohash_hex}")
 
             # 2. Find target video file

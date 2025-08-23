@@ -380,7 +380,7 @@ class ScreenshotService:
             if not packet:
                 raise RuntimeError("Could not find a keyframe near the target timestamp.")
 
-            self.log.info(f"Found keyframe at {packet.pts * stream.time_base:.2f}s for target {timestamp}")
+            self.log.info(f"Found keyframe at {float(packet.pts * stream.time_base):.2f}s for target {timestamp}")
 
             # 5. Prioritize and download pieces for the keyframe
             keyframe_pos = packet.pos

@@ -24,6 +24,9 @@ class ScreenshotService:
         self.alert_task = None
         self._running = False
 
+        # Event to signal when DHT is bootstrapped and ready
+        self.dht_ready = asyncio.Event()
+
         # Dictionaries to hold futures for pending events
         self.pending_metadata = {}
         self.pending_pieces = {}
@@ -72,6 +75,11 @@ class ScreenshotService:
                 if not pieces_to_wait_for:
                     future.set_result(True)
 
+    def _handle_dht_bootstrap(self, alert):
+        if not self.dht_ready.is_set():
+            self.dht_ready.set()
+            self.log.info("DHT bootstrapped. Service is ready to process tasks.")
+
     async def _alert_loop(self):
         while self._running:
             try:
@@ -83,6 +91,8 @@ class ScreenshotService:
                             self._handle_metadata_received(alert)
                         elif isinstance(alert, lt.piece_finished_alert):
                             self._handle_piece_finished(alert)
+                        elif isinstance(alert, lt.dht_bootstrap_alert):
+                            self._handle_dht_bootstrap(alert)
                 await asyncio.sleep(0.1)
             except asyncio.CancelledError:
                 break
@@ -103,6 +113,9 @@ class ScreenshotService:
         os.makedirs(save_dir, exist_ok=True)
 
         try:
+            # Wait for the DHT to be ready before proceeding
+            await self.dht_ready.wait()
+
             infohash_bytes = binascii.unhexlify(infohash_hex)
         except binascii.Error:
             self.log.error(f"Invalid infohash format: {infohash_hex}")
@@ -139,11 +152,10 @@ class ScreenshotService:
 
             # 3. Prioritize and download file header
             piece_size = ti.piece_length()
-            # Request first 4MB for the header
             header_size_to_download = 4 * 1024 * 1024
             head_pieces = {p.piece for p in ti.map_file(video_file_index, 0, header_size_to_download).file_slices}
 
-            handle.set_piece_deadline(list(head_pieces)[0], 1000) # Set deadline on first piece to kickstart
+            handle.set_piece_deadline(list(head_pieces)[0], 1000)
             for p in head_pieces:
                 handle.piece_priority(p, lt.download_priority.top_priority)
 
@@ -156,7 +168,6 @@ class ScreenshotService:
                 target_seconds = sum(int(x) * 60 ** i for i, x in enumerate(reversed(timestamp.split(':'))))
                 stream = container.streams.video[0]
 
-                # Find the keyframe packet at or before the target time
                 target_pts = target_seconds / stream.time_base
                 packet = None
                 container.seek(int(target_pts), backward=True, any_frame=False, stream=stream)

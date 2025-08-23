@@ -3,21 +3,18 @@ import signal
 import binascii
 import logging
 import os
+import pprint
 
 import bencode2 as bencoder
 from maga.crawler import Maga
 from maga.downloader import Downloader
 
-# 配置日志记录器
-logging.basicConfig(
-    # 设置根记录器的级别为DEBUG，这样所有级别的日志都会被处理
-    level=logging.DEBUG,
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-# (可选) 如果想减少其他库（如uvloop）的日志，可以单独提高它们的级别
-# logging.getLogger("uvloop").setLevel(logging.WARNING)
-
+# # 配置日志记录器 (注释掉以减少输出)
+# logging.basicConfig(
+#     level=logging.DEBUG,
+#     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+#     datefmt="%Y-%m-%d %H:%M:%S",
+# )
 
 # 使用一个集合（set）来记录已经提交给下载器的infohash
 # 这是为了防止爬虫因为频繁收到同一个infohash的announce消息而重复提交任务
@@ -44,23 +41,30 @@ async def process_results(downloader):
             # 将bencode编码后的数据写入.torrent文件
             with open(file_path, "wb") as f:
                 f.write(torrent_data)
-            logging.info(f"[保存成功] {infohash_hex}.torrent 已保存。")
+
+            # 按用户要求，只在成功后打印解码的元数据信息
+            print("="*30 + f" METADATA FOR {infohash_hex} " + "="*29)
+            pprint.pprint(metadata)
+            print("="*80)
+            print(f"[保存成功] {file_path} 已保存。\n")
+
         except Exception:
-            logging.exception(f"保存 {infohash_hex}.torrent 时出错。")
+            # 隐藏保存时的错误信息，保持安静
+            pass
         finally:
             # 通知队列这项任务已完成
             downloader.results_queue.task_done()
 
 
-async def print_dht_stats(downloader):
-    """
-    一个辅助函数，每10秒打印一次DHT路由表的状态
-    """
-    while True:
-        await asyncio.sleep(10)
-        # 从downloader服务中获取其内部的dht_node实例，并打印路由表节点总数
-        table_size = len(downloader.dht_node.routing_table.get_all_nodes())
-        print(f"[状态] DHT路由表当前包含 {table_size} 个节点。")
+# async def print_dht_stats(downloader):
+#     """
+#     一个辅助函数，每10秒打印一次DHT路由表的状态
+#     """
+#     while True:
+#         await asyncio.sleep(10)
+#         # 从downloader服务中获取其内部的dht_node实例，并打印路由表节点总数
+#         table_size = len(downloader.dht_node.routing_table.get_all_nodes())
+#         print(f"[状态] DHT路由表当前包含 {table_size} 个节点。")
 
 
 async def main():
@@ -82,7 +86,7 @@ async def main():
         if infohash_hex not in SUBMITTED_INFOHASHES:
             # 将它添加到已处理集合中，避免重复
             SUBMITTED_INFOHASHES.add(infohash_hex)
-            print(f"[爬虫] 发现新种源: {infohash_hex}，已提交给下载器。")
+            # print(f"[爬虫] 发现新种源: {infohash_hex}，已提交给下载器。") # 注释掉以减少输出
             # 异步地将infohash（bytes类型）提交到下载器的队列
             await downloader.submit(infohash)
 
@@ -98,12 +102,11 @@ async def main():
     await crawler.run(port=6881)
 
     # 启动后台任务
-    stats_task = loop.create_task(print_dht_stats(downloader))
+    # stats_task = loop.create_task(print_dht_stats(downloader)) # 注释掉以减少输出
     results_task = loop.create_task(process_results(downloader))
 
-    print("\n爬虫和下载器服务已开始运行。")
-    print("爬虫正在监听新的种子...")
-    print("下载器正在等待任务并下载元数据...")
+    print("服务已启动，正在后台爬取和下载...")
+    print("成功下载的元数据内容将被打印出来。")
     print("按 Ctrl+C 停止运行。")
 
     # 5. 等待程序被中断 (Ctrl+C)
@@ -113,7 +116,7 @@ async def main():
 
     # 6. 优雅地关闭服务
     print("\n正在停止服务...")
-    stats_task.cancel()
+    # stats_task.cancel() # 注释掉以减少输出
     results_task.cancel()
     downloader.stop()
     crawler.stop()

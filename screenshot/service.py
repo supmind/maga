@@ -1,4 +1,5 @@
 import asyncio
+import bisect
 import logging
 import binascii
 import os
@@ -440,21 +441,50 @@ class ScreenshotService:
                 self.log.error(f"Could not get a valid video duration for {infohash_hex}. Stopping task.")
                 return
 
-            # 5. Concurrently find all keyframes
+            # 5. Scan for all keyframes and get the time_base in a single, reliable operation.
+            all_keyframes, time_base = await self.loop.run_in_executor(
+                None, self._get_all_keyframes, handle, video_file_index
+            )
+
+            if not all_keyframes or not time_base:
+                self.log.error(f"Could not find any keyframes or get time_base for {infohash_hex}.")
+                return
+
+            # Create a sorted list of keyframe presentation timestamps (pts) for efficient searching.
+            keyframe_pts = [kf.pts for kf in all_keyframes]
+
+            # For each desired timestamp, find the best keyframe (the last one before or at the timestamp)
             num_screenshots = 20
             timestamp_secs = [(duration_sec / (num_screenshots + 1)) * (i + 1) for i in range(num_screenshots)]
 
-            find_tasks = [
-                self.loop.run_in_executor(None, self._find_keyframe_for_timestamp, handle, video_file_index, ts)
-                for ts in timestamp_secs
-            ]
-            packet_infos = await asyncio.gather(*find_tasks)
+            valid_packet_infos = []
+            for ts in timestamp_secs:
+                target_pts = int(ts / time_base)
+                # Find the insertion point for target_pts in the sorted list of keyframe PTS
+                # This gives us the index of the first keyframe *after* our target time.
+                insertion_point = bisect.bisect_right(keyframe_pts, target_pts)
 
-            # Filter out any failed lookups
-            valid_packet_infos = [info for info in packet_infos if info and info[0]]
+                # The keyframe we want is the one *before* the insertion point.
+                if insertion_point > 0:
+                    best_keyframe_index = insertion_point - 1
+                    keyframe_info = all_keyframes[best_keyframe_index]
+
+                    # To avoid getting the same early frame for multiple early timestamps,
+                    # we make sure we haven't used this keyframe already.
+                    is_duplicate = False
+                    for info, _ in valid_packet_infos:
+                        if info.pts == keyframe_info.pts:
+                            is_duplicate = True
+                            break
+
+                    if not is_duplicate:
+                        m, s = divmod(ts, 60)
+                        h, m = divmod(m, 60)
+                        timestamp_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
+                        valid_packet_infos.append((keyframe_info, timestamp_str))
 
             if not valid_packet_infos:
-                self.log.error(f"Could not find any valid keyframes for {infohash_hex}.")
+                self.log.error(f"Could not map any timestamps to valid keyframes for {infohash_hex}.")
                 return
 
             # 6. Prioritize all necessary pieces at once
@@ -517,40 +547,27 @@ class ScreenshotService:
             self.log.error(f"Could not determine video duration: {e!r}")
             return 0
 
-    def _find_keyframe_for_timestamp(self, handle, video_file_index, timestamp_sec):
+    def _get_all_keyframes(self, handle, video_file_index):
         """
-        Finds the keyframe packet closest to a given timestamp.
-        NOTE: This is a blocking function.
+        Scans the entire video file to find all keyframes and the time_base.
+        This is a slow, blocking operation, but more reliable than seeking by time.
         """
-        m, s = divmod(timestamp_sec, 60)
-        h, m = divmod(m, 60)
-        timestamp_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
-
+        self.log.debug("Scanning for all keyframes...")
         torrent_reader = TorrentFileReader(self, handle, video_file_index)
+        keyframes = []
         try:
             with av.open(torrent_reader) as container:
                 stream = container.streams.video[0]
-                # Seek to the frame before the target time
-                container.seek(int(timestamp_sec * 1000000), backward=True, any_frame=False, stream=stream)
-
-                # Find the next keyframe
-                packet = None
-                for p in container.demux(stream):
-                    if p.dts is not None and p.is_keyframe:
-                        packet = p
-                        break
-
-                if packet:
-                    info = KeyframeInfo(pts=packet.pts, pos=packet.pos, size=packet.size)
-                    self.log.debug(f"Found keyframe at {float(info.pts * stream.time_base):.2f}s for target {timestamp_str}")
-                    return info, timestamp_str
-                else:
-                    self.log.warning(f"Could not find keyframe near {timestamp_str}")
-                    return None, None
-
+                time_base = stream.time_base
+                for packet in container.demux(stream):
+                    if packet.dts is not None and packet.is_keyframe:
+                        info = KeyframeInfo(pts=packet.pts, pos=packet.pos, size=packet.size)
+                        keyframes.append(info)
+            self.log.debug(f"Found {len(keyframes)} total keyframes.")
+            return keyframes, time_base
         except Exception as e:
-            self.log.error(f"Error finding keyframe for {timestamp_str}: {e!r}")
-            return None, None
+            self.log.error(f"Could not scan for keyframes: {e!r}")
+            return [], None
 
     def _get_pieces_for_packet(self, ti, video_file_index, keyframe_info):
         """Calculates the set of pieces required for a given KeyframeInfo."""

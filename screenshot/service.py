@@ -375,6 +375,12 @@ class ScreenshotService:
 
             # 2. Find target video file
             ti = handle.get_torrent_info()
+
+            # Set all pieces to priority 0 to prevent automatic downloading.
+            # We will then selectively set the priority for the pieces we need.
+            num_pieces = ti.num_pieces()
+            handle.prioritize_pieces([0] * num_pieces)
+            self.log.debug(f"Set all {num_pieces} pieces to priority 0 to save bandwidth.")
             video_file_index = -1
             target_file = None
             max_size = -1

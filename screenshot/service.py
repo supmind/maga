@@ -6,7 +6,10 @@ import io
 import av
 import libtorrent as lt
 import threading
+from collections import namedtuple
 from concurrent.futures import Future
+
+KeyframeInfo = namedtuple('KeyframeInfo', ['pts', 'pos', 'size'])
 
 class LibtorrentError(Exception):
     def __init__(self, error_code):
@@ -79,34 +82,35 @@ class TorrentFileReader(io.RawIOBase):
             bytes_available_in_piece = piece_size - piece_offset
             read_len = min(bytes_to_go, bytes_available_in_piece)
 
-            if not self.handle.have_piece(piece_index):
-                raise IOError(f"BUG: Piece {piece_index} is not available, but it should have been pre-fetched.")
+            # We no longer check have_piece, as it seems unreliable.
+            # Instead, we just request the piece and block until we get it.
+            # The higher-level logic is responsible for ensuring the piece
+            # has been prioritized for download.
+            piece_data = None
+            # Check cache first
+            if self.last_read_piece_index == piece_index:
+                piece_data = self.last_read_piece_data
             else:
-                piece_data = None
-                # Check cache first
-                if self.last_read_piece_index == piece_index:
-                    piece_data = self.last_read_piece_data
-                else:
-                    future = Future()
-                    with self.service.read_lock:
-                        self.service.pending_reads[piece_index] = future
+                future = Future()
+                with self.service.read_lock:
+                    self.service.pending_reads[piece_index] = future
 
-                    self.handle.read_piece(piece_index)
-                    piece_data = future.result(timeout=60)
+                self.handle.read_piece(piece_index)
+                piece_data = future.result(timeout=60)
 
-                    # Update cache
-                    self.last_read_piece_index = piece_index
-                    self.last_read_piece_data = piece_data
+                # Update cache
+                self.last_read_piece_index = piece_index
+                self.last_read_piece_data = piece_data
 
-                if piece_data is None:
-                    # This can happen if the read times out or fails.
-                    # We'll clear the cache and raise an error.
-                    self.last_read_piece_index = -1
-                    self.last_read_piece_data = None
-                    raise IOError(f"Failed to read piece {piece_index}: read_piece returned None")
+            if piece_data is None:
+                # This can happen if the read times out or fails.
+                # We'll clear the cache and raise an error.
+                self.last_read_piece_index = -1
+                self.last_read_piece_data = None
+                raise IOError(f"Failed to read piece {piece_index}: read_piece returned None")
 
-                chunk = piece_data[piece_offset : piece_offset + read_len]
-                result_buffer[buffer_offset : buffer_offset + len(chunk)] = chunk
+            chunk = piece_data[piece_offset : piece_offset + read_len]
+            result_buffer[buffer_offset : buffer_offset + len(chunk)] = chunk
 
             buffer_offset += read_len
             bytes_to_go -= read_len
@@ -128,7 +132,11 @@ class ScreenshotService:
             'listen_interfaces': '0.0.0.0:6881',
             'enable_dht': True,
             'alert_mask': lt.alert_category.error | lt.alert_category.status | lt.alert_category.dht | lt.alert_category.peer | lt.alert_category.tracker,
-            'dht_bootstrap_nodes': 'router.bittorrent.com:6881,dht.transmissionbt.com:6881,router.utorrent.com:6881'
+            'dht_bootstrap_nodes': 'router.bittorrent.com:6881,dht.transmissionbt.com:6881,router.utorrent.com:6881',
+            # Set a larger cache size (64 MB) to prevent piece eviction.
+            # Even if docs say it's deprecated, it might be necessary for this binding.
+            'cache_size': 4096,
+            'suggest_mode': lt.suggest_mode_t.suggest_read_cache,
         }
         self.ses = lt.session(settings)
 
@@ -140,9 +148,9 @@ class ScreenshotService:
         # Event to signal when DHT is bootstrapped and ready
         self.dht_ready = asyncio.Event()
 
-        # Dictionaries to hold futures for pending events
+        # Data structures to hold futures for pending events
         self.pending_metadata = {}
-        self.pending_pieces = {}
+        self.pending_pieces = [] # A list of (future, pieces_set)
         self.pending_reads = {}
         self.read_lock = threading.Lock()
 
@@ -182,21 +190,19 @@ class ScreenshotService:
                 future.set_result(alert.handle)
 
     def _handle_piece_finished(self, alert):
-        infohash_str = str(alert.handle.info_hash())
-        if infohash_str in self.pending_pieces:
-            future, pieces_to_wait_for = self.pending_pieces[infohash_str]
+        # This is not the most efficient way, but for 20 screenshots it's fine.
+        # A more optimized approach would use a dict mapping piece_index to futures.
+        for future, pieces_to_wait_for in self.pending_pieces:
             if not future.done():
                 pieces_to_wait_for.discard(alert.piece_index)
                 if not pieces_to_wait_for:
                     future.set_result(True)
 
     def _handle_torrent_finished(self, alert):
-        infohash_str = str(alert.handle.info_hash())
-        if infohash_str in self.pending_pieces:
-            future, _ = self.pending_pieces[infohash_str]
+        # In case the torrent finishes while we are waiting for specific pieces
+        for future, _ in self.pending_pieces:
             if not future.done():
-                self.log.debug(f"Torrent {infohash_str} finished, resolving pending piece future.")
-                future.set_result(True)
+                future.set_result(True) # Resolve all pending piece futures
 
     def _handle_dht_bootstrap(self, alert):
         if not self.dht_ready.is_set():
@@ -265,12 +271,14 @@ class ScreenshotService:
         self.log.debug(f"Waiting for {len(pieces_to_actually_wait_for)} out of {len(pieces_to_download)} requested pieces.")
 
         future = self.loop.create_future()
-        self.pending_pieces[infohash_hex] = (future, pieces_to_actually_wait_for)
+        waiter = (future, pieces_to_actually_wait_for)
+        self.pending_pieces.append(waiter)
         try:
             await asyncio.wait_for(future, timeout=180)
         finally:
-            # Ensure we clean up the pending future key, even if we time out
-            self.pending_pieces.pop(infohash_hex, None)
+            # Ensure we clean up the pending waiter, even if we time out
+            if waiter in self.pending_pieces:
+                self.pending_pieces.remove(waiter)
 
     async def _handle_screenshot_task(self, infohash_hex):
         self.log.info(f"Processing task for {infohash_hex}")
@@ -357,32 +365,47 @@ class ScreenshotService:
             duration_sec = await self.loop.run_in_executor(
                 None, self._get_video_duration, handle, video_file_index
             )
-
             if not duration_sec or duration_sec <= 0:
                 self.log.error(f"Could not get a valid video duration for {infohash_hex}. Stopping task.")
                 return
 
-            # 5. Loop to take 20 screenshots at even intervals
-            self.log.info(f"Beginning to take 20 screenshots for {infohash_hex}...")
+            # 5. Concurrently find all keyframes
             num_screenshots = 20
-            for i in range(num_screenshots):
-                # Calculate the timestamp in the middle of each segment
-                interval = duration_sec / num_screenshots
-                target_sec = interval * (i + 0.5)
+            timestamp_secs = [(duration_sec / (num_screenshots + 1)) * (i + 1) for i in range(num_screenshots)]
 
-                # Format timestamp for the screenshot function and filename
-                m, s = divmod(target_sec, 60)
-                h, m = divmod(m, 60)
-                timestamp_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
+            find_tasks = [
+                self.loop.run_in_executor(None, self._find_keyframe_for_timestamp, handle, video_file_index, ts)
+                for ts in timestamp_secs
+            ]
+            packet_infos = await asyncio.gather(*find_tasks)
 
-                self.log.info(f"Taking screenshot #{i+1}/{num_screenshots} at {timestamp_str}")
+            # Filter out any failed lookups
+            valid_packet_infos = [info for info in packet_infos if info and info[0]]
 
-                # Run the blocking screenshot process in an executor
-                await self.loop.run_in_executor(
-                    None, self._process_video_file, handle, video_file_index, timestamp_str, infohash_hex
-                )
+            if not valid_packet_infos:
+                self.log.error(f"Could not find any valid keyframes for {infohash_hex}.")
+                return
 
-            self.log.info(f"Finished taking 20 screenshots for {infohash_hex}.")
+            # 6. Prioritize all necessary pieces at once
+            all_pieces_needed = set()
+            pieces_per_keyframe = []
+            for keyframe_info, timestamp_str in valid_packet_infos:
+                pieces = self._get_pieces_for_packet(ti, video_file_index, keyframe_info)
+                pieces_per_keyframe.append(pieces)
+                all_pieces_needed.update(pieces)
+
+            self.log.info(f"Requesting {len(all_pieces_needed)} unique pieces for {len(valid_packet_infos)} screenshots.")
+            for piece_index in all_pieces_needed:
+                handle.piece_priority(piece_index, 7)
+
+            # 7. Concurrently wait for pieces and decode
+            decode_tasks = [
+                self._wait_and_decode_one_screenshot(handle, video_file_index, infohash_hex, packet_info, pieces)
+                for packet_info, pieces in zip(valid_packet_infos, pieces_per_keyframe)
+            ]
+            await asyncio.gather(*decode_tasks)
+
+            self.log.info(f"Finished taking {len(valid_packet_infos)} screenshots for {infohash_hex}.")
 
         except asyncio.TimeoutError:
             self.log.error(f"Timeout during screenshot task for {infohash_hex}")
@@ -394,6 +417,17 @@ class ScreenshotService:
                 self.pending_metadata.pop(infohash_hex, None)
             if handle:
                 self.ses.remove_torrent(handle, lt.session.delete_files)
+
+    async def _wait_and_decode_one_screenshot(self, handle, video_file_index, infohash_hex, packet_info, pieces_needed):
+        keyframe_info, timestamp_str = packet_info
+
+        self.log.debug(f"Waiting for {len(pieces_needed)} pieces for timestamp {timestamp_str}")
+        await self._wait_for_pieces(infohash_hex, handle, pieces_needed)
+        self.log.debug(f"Pieces for timestamp {timestamp_str} are ready.")
+
+        await self.loop.run_in_executor(
+            None, self._decode_and_save_frame, handle, video_file_index, keyframe_info, infohash_hex, timestamp_str
+        )
 
     def _get_video_duration(self, handle, video_file_index):
         """
@@ -409,70 +443,78 @@ class ScreenshotService:
                 self.log.debug(f"Detected video duration: {duration_sec:.2f} seconds.")
                 return duration_sec
         except Exception as e:
-            self.log.error(f"Could not determine video duration: {e}")
+            self.log.error(f"Could not determine video duration: {e!r}")
             return 0
 
-    def _process_video_file(self, handle, video_file_index, timestamp, infohash_hex):
-        ti = handle.get_torrent_info()
+    def _find_keyframe_for_timestamp(self, handle, video_file_index, timestamp_sec):
+        """
+        Finds the keyframe packet closest to a given timestamp.
+        NOTE: This is a blocking function.
+        """
+        m, s = divmod(timestamp_sec, 60)
+        h, m = divmod(m, 60)
+        timestamp_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
 
-        # 4. Use PyAV with our custom file-like object to find the target keyframe
-        self.log.debug("Opening video container to find keyframe...")
         torrent_reader = TorrentFileReader(self, handle, video_file_index)
+        try:
+            with av.open(torrent_reader) as container:
+                stream = container.streams.video[0]
+                # Seek to the frame before the target time
+                container.seek(int(timestamp_sec * 1000000), backward=True, any_frame=False, stream=stream)
 
-        with av.open(torrent_reader) as container:
-            target_seconds = sum(int(x) * 60 ** i for i, x in enumerate(reversed(timestamp.split(':'))))
-            stream = container.streams.video[0]
+                # Find the next keyframe
+                packet = None
+                for p in container.demux(stream):
+                    if p.dts is not None and p.is_keyframe:
+                        packet = p
+                        break
 
-            container.seek(int(target_seconds * 1000000), backward=True, any_frame=False, stream=stream)
+                if packet:
+                    info = KeyframeInfo(pts=packet.pts, pos=packet.pos, size=packet.size)
+                    self.log.debug(f"Found keyframe at {float(info.pts * stream.time_base):.2f}s for target {timestamp_str}")
+                    return info, timestamp_str
+                else:
+                    self.log.warning(f"Could not find keyframe near {timestamp_str}")
+                    return None, None
 
-            packet = None
-            for p in container.demux(stream):
-                if p.dts is None: continue
-                if p.is_keyframe:
-                    packet = p
-                    break
+        except Exception as e:
+            self.log.error(f"Error finding keyframe for {timestamp_str}: {e!r}")
+            return None, None
 
-            if not packet:
-                raise RuntimeError("Could not find a keyframe near the target timestamp.")
+    def _get_pieces_for_packet(self, ti, video_file_index, keyframe_info):
+        """Calculates the set of pieces required for a given KeyframeInfo."""
+        start_req = ti.map_file(video_file_index, keyframe_info.pos, 1)
+        # The keyframe_info.size can be 0 sometimes, so read at least 1 byte
+        read_size = max(1, keyframe_info.size)
+        end_req = ti.map_file(video_file_index, keyframe_info.pos + read_size - 1, 1)
+        return set(range(start_req.piece, end_req.piece + 1))
 
-            self.log.debug(f"Found keyframe at {float(packet.pts * stream.time_base):.2f}s for target {timestamp}")
+    def _decode_and_save_frame(self, handle, video_file_index, keyframe_info, infohash_hex, timestamp_str):
+        """
+        Decodes a single frame from a keyframe_info and saves it.
+        Assumes the necessary pieces are already downloaded.
+        NOTE: This is a blocking function.
+        """
+        self.log.debug(f"Decoding frame for timestamp {timestamp_str}")
+        torrent_reader = TorrentFileReader(self, handle, video_file_index)
+        try:
+            with av.open(torrent_reader) as container:
+                stream = container.streams.video[0]
+                container.seek(keyframe_info.pts, stream=stream)
 
-            # 5. Prioritize and download pieces for the keyframe
-            keyframe_pos = packet.pos
-            keyframe_size = packet.size
-            start_piece_req = ti.map_file(video_file_index, keyframe_pos, 1)
-            last_byte_offset = max(0, keyframe_pos + keyframe_size - 1)
-            end_piece_req = ti.map_file(video_file_index, last_byte_offset, 1)
-            keyframe_pieces = set(range(start_piece_req.piece, end_piece_req.piece + 1))
+                for frame in container.decode(stream):
+                    if frame.pts >= keyframe_info.pts:
+                        output_dir = "/tmp/screenshots"
+                        output_filename = f"{output_dir}/{infohash_hex}_{timestamp_str.replace(':', '-')}.jpg"
+                        os.makedirs(output_dir, exist_ok=True)
+                        frame.to_image().save(output_filename)
+                        self.log.info(f"SUCCESS: Screenshot saved to {output_filename}")
+                        return
 
-            for p in keyframe_pieces:
-                # We need to call piece_priority from the main event loop thread
-                self.loop.call_soon_threadsafe(handle.piece_priority, p, 7)
+                self.log.error(f"Failed to decode frame after re-seeking for timestamp {timestamp_str}")
 
-            # This is a blocking call, but it's okay since we are in a worker thread.
-            # We create a new future on the main event loop to wait for the pieces.
-            future = asyncio.run_coroutine_threadsafe(
-                self._wait_for_pieces(infohash_hex, handle, keyframe_pieces.copy()),
-                self.loop
-            )
-            future.result(timeout=180) # Block this thread waiting for the result
-            self.log.debug("Keyframe data downloaded.")
-
-            # 6. Take screenshot by re-seeking and decoding in the same container
-            self.log.debug("Re-seeking to keyframe to decode...")
-            container.seek(packet.pts, stream=stream)
-
-            # Decode frames until we get the one at or after our target packet's timestamp
-            for frame in container.decode(video=0):
-                if frame.pts >= packet.pts:
-                    output_dir = "/tmp/screenshots"
-                    output_filename = f"{output_dir}/{infohash_hex}_{timestamp.replace(':', '-')}.jpg"
-                    os.makedirs(output_dir, exist_ok=True)
-                    frame.to_image().save(output_filename)
-                    self.log.info(f"SUCCESS: Screenshot saved to {output_filename}")
-                    return # Exit the function successfully
-
-            raise RuntimeError("Failed to decode frame after re-seeking.")
+        except Exception as e:
+            self.log.error(f"Error decoding frame for {timestamp_str}: {e!r}")
 
     async def _worker(self):
         while self._running:

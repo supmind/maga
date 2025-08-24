@@ -6,7 +6,7 @@ import io
 import av
 import libtorrent as lt
 import threading
-from collections import namedtuple, defaultdict
+from collections import namedtuple, defaultdict, OrderedDict
 from concurrent.futures import Future
 
 KeyframeInfo = namedtuple('KeyframeInfo', ['pts', 'pos', 'size'])
@@ -37,9 +37,9 @@ class TorrentFileReader(io.RawIOBase):
         self.file_size = self.file_entry.size
         self.pos = 0
 
-        # Cache for the last read piece to avoid redundant reads
-        self.last_read_piece_index = -1
-        self.last_read_piece_data = None
+        # LRU cache for pieces to reduce requests to the main thread
+        self.piece_cache = OrderedDict()
+        self.PIECE_CACHE_SIZE = 4  # Cache up to 4 pieces
 
         self.log = logging.getLogger("TorrentFileReader")
 
@@ -82,15 +82,15 @@ class TorrentFileReader(io.RawIOBase):
             bytes_available_in_piece = piece_size - piece_offset
             read_len = min(bytes_to_go, bytes_available_in_piece)
 
-            # We no longer check have_piece, as it seems unreliable.
-            # Instead, we just request the piece and block until we get it.
             # The higher-level logic is responsible for ensuring the piece
             # has been prioritized for download.
             piece_data = None
             # Check cache first
-            if self.last_read_piece_index == piece_index:
-                piece_data = self.last_read_piece_data
+            if piece_index in self.piece_cache:
+                piece_data = self.piece_cache[piece_index]
+                self.piece_cache.move_to_end(piece_index) # Mark as recently used
             else:
+                # Cache miss: request the piece from the main thread
                 future = Future()
                 call_read_piece = False
                 with self.service.read_lock:
@@ -105,14 +105,12 @@ class TorrentFileReader(io.RawIOBase):
                 piece_data = future.result(timeout=60)
 
                 # Update cache
-                self.last_read_piece_index = piece_index
-                self.last_read_piece_data = piece_data
+                self.piece_cache[piece_index] = piece_data
+                if len(self.piece_cache) > self.PIECE_CACHE_SIZE:
+                    self.piece_cache.popitem(last=False) # Evict least recently used
 
             if piece_data is None:
                 # This can happen if the read times out or fails.
-                # We'll clear the cache and raise an error.
-                self.last_read_piece_index = -1
-                self.last_read_piece_data = None
                 raise IOError(f"Failed to read piece {piece_index}: read_piece returned None")
 
             chunk = piece_data[piece_offset : piece_offset + read_len]
@@ -156,7 +154,9 @@ class ScreenshotService:
 
         # Data structures to hold futures for pending events
         self.pending_metadata = {}
-        self.pending_pieces = [] # A list of (future, pieces_set)
+        # A dictionary mapping a piece index to a list of "waiter" objects.
+        # Each waiter tracks a future and how many pieces that future is waiting for.
+        self.piece_to_waiters = defaultdict(list)
         self.pending_reads = defaultdict(list)
         self.read_lock = threading.Lock()
 
@@ -196,19 +196,38 @@ class ScreenshotService:
                 future.set_result(alert.handle)
 
     def _handle_piece_finished(self, alert):
-        # This is not the most efficient way, but for 20 screenshots it's fine.
-        # A more optimized approach would use a dict mapping piece_index to futures.
-        for future, pieces_to_wait_for in self.pending_pieces:
-            if not future.done():
-                pieces_to_wait_for.discard(alert.piece_index)
-                if not pieces_to_wait_for:
-                    future.set_result(True)
+        # This is an O(1) lookup for the piece index.
+        # We pop the list of waiters, as we won't get another alert for this piece.
+        waiters_for_piece = self.piece_to_waiters.pop(alert.piece_index, [])
+
+        for waiter in waiters_for_piece:
+            waiter['remaining'] -= 1
+            if waiter['remaining'] <= 0 and not waiter['future'].done():
+                # This future is now resolved, its on_done callback will handle
+                # removing the waiter from any other piece lists it might be in.
+                waiter['future'].set_result(True)
 
     def _handle_torrent_finished(self, alert):
-        # In case the torrent finishes while we are waiting for specific pieces
-        for future, _ in self.pending_pieces:
-            if not future.done():
-                future.set_result(True) # Resolve all pending piece futures
+        # In case the torrent finishes while we are waiting for specific pieces,
+        # resolve all pending futures. This is a broad signal, and a more
+        # precise implementation would associate waiters with torrent handles.
+        # This implementation preserves the original's behavior.
+
+        # 1. Collect all unique, pending futures.
+        futures_to_resolve = set()
+        for waiters_list in self.piece_to_waiters.values():
+            for waiter in waiters_list:
+                if not waiter['future'].done():
+                    futures_to_resolve.add(waiter['future'])
+
+        # 2. Resolve all collected futures. The on_done callback on each future
+        # will attempt to clean up its entries from the piece_to_waiters dict.
+        for fut in futures_to_resolve:
+            fut.set_result(True)
+
+        # 3. As a final measure, clear the dictionary to prevent any stale entries.
+        # This is safe because all legitimate waiters have been resolved.
+        self.piece_to_waiters.clear()
 
     def _handle_dht_bootstrap(self, alert):
         if not self.dht_ready.is_set():
@@ -279,20 +298,46 @@ class ScreenshotService:
         self.log.debug(f"Waiting for {len(pieces_to_actually_wait_for)} out of {len(pieces_to_download)} requested pieces.")
 
         future = self.loop.create_future()
-        waiter = (future, pieces_to_actually_wait_for)
-        self.pending_pieces.append(waiter)
+        waiter = {
+            "future": future,
+            "pieces": pieces_to_actually_wait_for,
+            "remaining": len(pieces_to_actually_wait_for),
+        }
+
+        # Cleanup function to be called when the future is done (success or timeout)
+        def on_done(fut):
+            # Remove this waiter from all piece lists it was added to.
+            # This is crucial to prevent memory leaks if the wait times out.
+            for piece_index in waiter['pieces']:
+                waiters_list = self.piece_to_waiters.get(piece_index)
+                if waiters_list:
+                    try:
+                        # Use a loop for safe removal, as the same waiter object
+                        # might have been added multiple times if logic were to change.
+                        while waiter in waiters_list:
+                            waiters_list.remove(waiter)
+                    except ValueError:
+                        pass # Should not happen with `in` check, but good practice
+
+        future.add_done_callback(on_done)
+
+        # Register the waiter for each piece it's waiting for
+        for piece_index in pieces_to_actually_wait_for:
+            self.piece_to_waiters[piece_index].append(waiter)
+
         try:
             await asyncio.wait_for(future, timeout=180)
-        finally:
-            # Ensure we clean up the pending waiter, even if we time out
-            if waiter in self.pending_pieces:
-                self.pending_pieces.remove(waiter)
+        except asyncio.TimeoutError:
+            self.log.warning(f"Timeout waiting for {len(waiter['pieces'])} pieces for {infohash_hex}.")
+            # The on_done callback will have already been triggered and cleaned up.
+            raise # Re-raise the timeout to be handled by the caller
 
     async def _handle_screenshot_task(self, infohash_hex):
         self.log.info(f"Processing task for {infohash_hex}")
         handle = None
         infohash_bytes = None
-        save_dir = f"/tmp/downloads/{infohash_hex}"
+        # Use shared memory for saving torrent data to avoid disk I/O
+        save_dir = f"/dev/shm/{infohash_hex}"
         os.makedirs(save_dir, exist_ok=True)
 
         try:
@@ -367,7 +412,24 @@ class ScreenshotService:
             self.log.debug("Waiting for header pieces...")
             await self._wait_for_pieces(infohash_hex, handle, head_pieces.copy())
             self.log.debug("Header pieces finished.")
-            self.log.debug(f"Header for {target_file.path} downloaded.")
+
+            # Also download the footer, as the video index (moov atom) might be there.
+            footer_size_to_download = 5 * 1024 * 1024
+            footer_start_offset = max(0, target_file.size - footer_size_to_download)
+
+            if footer_start_offset > header_size_to_download: # Avoid re-downloading if files are small
+                start_piece_req_foot = ti.map_file(video_file_index, footer_start_offset, 1)
+                end_piece_req_foot = ti.map_file(video_file_index, target_file.size - 1, 1)
+                foot_pieces = set(range(start_piece_req_foot.piece, end_piece_req_foot.piece + 1))
+
+                if foot_pieces:
+                    for p in foot_pieces:
+                        handle.piece_priority(p, 7)
+                    self.log.debug(f"Downloading footer for {target_file.path} ({len(foot_pieces)} pieces)...")
+                    await self._wait_for_pieces(infohash_hex, handle, foot_pieces.copy())
+                    self.log.debug("Footer pieces finished.")
+
+            self.log.debug(f"Header and footer for {target_file.path} downloaded.")
 
             # 4. Get video duration
             duration_sec = await self.loop.run_in_executor(
@@ -512,7 +574,8 @@ class ScreenshotService:
 
                 for frame in container.decode(stream):
                     if frame.pts >= keyframe_info.pts:
-                        output_dir = "/tmp/screenshots"
+                        # Use shared memory for screenshots to avoid disk I/O
+                        output_dir = "/dev/shm/screenshots"
                         output_filename = f"{output_dir}/{infohash_hex}_{timestamp_str.replace(':', '-')}.jpg"
                         os.makedirs(output_dir, exist_ok=True)
                         frame.to_image().save(output_filename)

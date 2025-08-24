@@ -375,12 +375,12 @@ class ScreenshotService:
 
             # 2. Find target video file
             ti = handle.get_torrent_info()
+            total_pieces = ti.num_pieces()
 
             # Set all pieces to priority 0 to prevent automatic downloading.
             # We will then selectively set the priority for the pieces we need.
-            num_pieces = ti.num_pieces()
-            handle.prioritize_pieces([0] * num_pieces)
-            self.log.debug(f"Set all {num_pieces} pieces to priority 0 to save bandwidth.")
+            handle.prioritize_pieces([0] * total_pieces)
+            self.log.debug(f"Set all {total_pieces} pieces to priority 0 to save bandwidth.")
             video_file_index = -1
             target_file = None
             max_size = -1
@@ -500,6 +500,17 @@ class ScreenshotService:
                 pieces = self._get_pieces_for_packet(ti, video_file_index, keyframe_info)
                 pieces_per_keyframe.append(pieces)
                 all_pieces_needed.update(pieces)
+
+            # Calculate and log the *required* download percentage
+            # This is the theoretical minimum we must download.
+            required_pieces = head_pieces.copy()
+            if 'foot_pieces' in locals():
+                required_pieces.update(foot_pieces)
+            required_pieces.update(all_pieces_needed)
+
+            if total_pieces > 0:
+                required_percentage = (len(required_pieces) / total_pieces) * 100
+                self.log.info(f"必需 piece 占比: {len(required_pieces)} / {total_pieces} 个 pieces ({required_percentage:.2f}%).")
 
             self.log.info(f"Requesting {len(all_pieces_needed)} unique pieces for {len(valid_packet_infos)} screenshots.")
             for piece_index in all_pieces_needed:

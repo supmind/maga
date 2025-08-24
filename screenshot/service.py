@@ -6,7 +6,7 @@ import io
 import av
 import libtorrent as lt
 import threading
-from collections import namedtuple
+from collections import namedtuple, defaultdict
 from concurrent.futures import Future
 
 KeyframeInfo = namedtuple('KeyframeInfo', ['pts', 'pos', 'size'])
@@ -92,10 +92,16 @@ class TorrentFileReader(io.RawIOBase):
                 piece_data = self.last_read_piece_data
             else:
                 future = Future()
+                call_read_piece = False
                 with self.service.read_lock:
-                    self.service.pending_reads[piece_index] = future
+                    # If we are the first to request this piece, we trigger the read.
+                    if not self.service.pending_reads[piece_index]:
+                        call_read_piece = True
+                    self.service.pending_reads[piece_index].append(future)
 
-                self.handle.read_piece(piece_index)
+                if call_read_piece:
+                    self.handle.read_piece(piece_index)
+
                 piece_data = future.result(timeout=60)
 
                 # Update cache
@@ -151,7 +157,7 @@ class ScreenshotService:
         # Data structures to hold futures for pending events
         self.pending_metadata = {}
         self.pending_pieces = [] # A list of (future, pieces_set)
-        self.pending_reads = {}
+        self.pending_reads = defaultdict(list)
         self.read_lock = threading.Lock()
 
     async def run(self):
@@ -217,12 +223,14 @@ class ScreenshotService:
 
     def _handle_read_piece(self, alert):
         with self.read_lock:
-            future = self.pending_reads.pop(alert.piece, None)
-        if future:
-            # The `alert.error` is unreliable. The error message is "Success"
-            # yet the error flag is set. We will assume the alert means the
-            # buffer is valid.
-            future.set_result(bytes(alert.buffer))
+            # There might be multiple futures waiting for the same piece
+            futures = self.pending_reads.pop(alert.piece, [])
+
+        # The `alert.error` is unreliable. We assume the buffer is valid.
+        data = bytes(alert.buffer)
+        for future in futures:
+            if not future.done():
+                future.set_result(data)
 
     async def _alert_loop(self):
         while self._running:

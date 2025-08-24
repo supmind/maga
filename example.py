@@ -18,6 +18,9 @@ async def main():
     loop = asyncio.get_running_loop()
 
     # Create and run the screenshot service
+    # Screenshots will be saved to the default directory: './screenshots_output'
+    # To specify a different directory, use:
+    # service = ScreenshotService(loop=loop, output_dir='/path/to/your/dir')
     service = ScreenshotService(loop=loop)
     await service.run()
 
@@ -31,7 +34,7 @@ async def main():
 
     print("\nScreenshot service is running.")
     print("Submitted 1 example task. The service will now process it.")
-    print("Screenshots will be saved in the 'screenshots/' directory.")
+    print(f"Screenshots will be saved in the '{service.output_dir}' directory.")
     print("Press Ctrl+C to stop the service.")
 
     # Wait for graceful shutdown or timeout

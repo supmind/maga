@@ -39,7 +39,7 @@ class TorrentFileReader(io.RawIOBase):
 
         # LRU cache for pieces to reduce requests to the main thread
         self.piece_cache = OrderedDict()
-        self.PIECE_CACHE_SIZE = 4  # Cache up to 4 pieces
+        self.PIECE_CACHE_SIZE = 16  # Cache up to 16 pieces
 
         self.log = logging.getLogger("TorrentFileReader")
 
@@ -127,9 +127,10 @@ class TorrentFileReader(io.RawIOBase):
 # ScreenshotService
 # ==============================================================================
 class ScreenshotService:
-    def __init__(self, loop=None, num_workers=10):
+    def __init__(self, loop=None, num_workers=10, output_dir='./screenshots_output'):
         self.loop = loop or asyncio.get_event_loop()
         self.num_workers = num_workers
+        self.output_dir = output_dir
         self.log = logging.getLogger("ScreenshotService")
 
         settings = {
@@ -574,10 +575,8 @@ class ScreenshotService:
 
                 for frame in container.decode(stream):
                     if frame.pts >= keyframe_info.pts:
-                        # Use shared memory for screenshots to avoid disk I/O
-                        output_dir = "/dev/shm/screenshots"
-                        output_filename = f"{output_dir}/{infohash_hex}_{timestamp_str.replace(':', '-')}.jpg"
-                        os.makedirs(output_dir, exist_ok=True)
+                        output_filename = f"{self.output_dir}/{infohash_hex}_{timestamp_str.replace(':', '-')}.jpg"
+                        os.makedirs(self.output_dir, exist_ok=True)
                         frame.to_image().save(output_filename)
                         self.log.info(f"SUCCESS: Screenshot saved to {output_filename}")
                         return

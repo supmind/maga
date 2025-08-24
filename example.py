@@ -24,17 +24,13 @@ async def main():
     # --- Example Tasks ---
     # Submit a few screenshot tasks to the service.
     # The user should replace these with real infohashes and desired timestamps.
-    tasks_to_submit = [
+    # Sintel - an open-source movie torrent
+    infohash_to_submit = "08ada5a7a6183aae1e09d831df6748d566095a10"
 
-        # Sintel - another open-source movie torrent
-        ("08ada5a7a6183aae1e09d831df6748d566095a10", "00:05:00")
-    ]
-
-    for infohash, timestamp in tasks_to_submit:
-        await service.submit_task(infohash, timestamp)
+    await service.submit_task(infohash_to_submit)
 
     print("\nScreenshot service is running.")
-    print(f"Submitted {len(tasks_to_submit)} example tasks. The service will now process them.")
+    print("Submitted 1 example task. The service will now process it.")
     print("Screenshots will be saved in the 'screenshots/' directory.")
     print("Press Ctrl+C to stop the service.")
 

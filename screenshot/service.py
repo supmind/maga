@@ -170,8 +170,8 @@ class ScreenshotService:
         del self.ses
         self.log.info("Screenshot Service stopped.")
 
-    async def submit_task(self, infohash, timestamp):
-        await self.task_queue.put((infohash, timestamp))
+    async def submit_task(self, infohash):
+        await self.task_queue.put(infohash)
         self.log.info(f"Submitted task for infohash: {infohash}")
 
     def _handle_metadata_received(self, alert):
@@ -272,8 +272,8 @@ class ScreenshotService:
             # Ensure we clean up the pending future key, even if we time out
             self.pending_pieces.pop(infohash_hex, None)
 
-    async def _handle_screenshot_task(self, infohash_hex, timestamp):
-        self.log.info(f"Processing task for {infohash_hex} at {timestamp}")
+    async def _handle_screenshot_task(self, infohash_hex):
+        self.log.info(f"Processing task for {infohash_hex}")
         handle = None
         infohash_bytes = None
         save_dir = f"/tmp/downloads/{infohash_hex}"
@@ -353,10 +353,36 @@ class ScreenshotService:
             self.log.debug("Header pieces finished.")
             self.log.debug(f"Header for {target_file.path} downloaded.")
 
-            # 4. Run the blocking PyAV operations in a separate thread
-            await self.loop.run_in_executor(
-                None, self._process_video_file, handle, video_file_index, timestamp, infohash_hex
+            # 4. Get video duration
+            duration_sec = await self.loop.run_in_executor(
+                None, self._get_video_duration, handle, video_file_index
             )
+
+            if not duration_sec or duration_sec <= 0:
+                self.log.error(f"Could not get a valid video duration for {infohash_hex}. Stopping task.")
+                return
+
+            # 5. Loop to take 20 screenshots at even intervals
+            self.log.info(f"Beginning to take 20 screenshots for {infohash_hex}...")
+            num_screenshots = 20
+            for i in range(num_screenshots):
+                # Calculate the timestamp in the middle of each segment
+                interval = duration_sec / num_screenshots
+                target_sec = interval * (i + 0.5)
+
+                # Format timestamp for the screenshot function and filename
+                m, s = divmod(target_sec, 60)
+                h, m = divmod(m, 60)
+                timestamp_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
+
+                self.log.info(f"Taking screenshot #{i+1}/{num_screenshots} at {timestamp_str}")
+
+                # Run the blocking screenshot process in an executor
+                await self.loop.run_in_executor(
+                    None, self._process_video_file, handle, video_file_index, timestamp_str, infohash_hex
+                )
+
+            self.log.info(f"Finished taking 20 screenshots for {infohash_hex}.")
 
         except asyncio.TimeoutError:
             self.log.error(f"Timeout during screenshot task for {infohash_hex}")
@@ -368,6 +394,23 @@ class ScreenshotService:
                 self.pending_metadata.pop(infohash_hex, None)
             if handle:
                 self.ses.remove_torrent(handle, lt.session.delete_files)
+
+    def _get_video_duration(self, handle, video_file_index):
+        """
+        Reads the video metadata to determine its duration.
+        NOTE: This is a blocking function and should be run in an executor.
+        """
+        self.log.debug("Opening video container to get duration...")
+        torrent_reader = TorrentFileReader(self, handle, video_file_index)
+        try:
+            with av.open(torrent_reader) as container:
+                # duration is in microseconds, convert to seconds
+                duration_sec = container.duration / 1000000.0
+                self.log.debug(f"Detected video duration: {duration_sec:.2f} seconds.")
+                return duration_sec
+        except Exception as e:
+            self.log.error(f"Could not determine video duration: {e}")
+            return 0
 
     def _process_video_file(self, handle, video_file_index, timestamp, infohash_hex):
         ti = handle.get_torrent_info()
@@ -435,9 +478,9 @@ class ScreenshotService:
         while self._running:
             got_task = False
             try:
-                infohash, timestamp = await self.task_queue.get()
+                infohash = await self.task_queue.get()
                 got_task = True
-                await self._handle_screenshot_task(infohash, timestamp)
+                await self._handle_screenshot_task(infohash)
             except asyncio.CancelledError:
                 break
             except Exception:

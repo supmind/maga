@@ -508,6 +508,13 @@ class ScreenshotService:
 
             self.log.info(f"Finished taking {len(valid_packet_infos)} screenshots for {infohash_hex}.")
 
+            # Calculate and log download statistics
+            total_pieces = ti.num_pieces()
+            if total_pieces > 0:
+                downloaded_pieces = sum(1 for i in range(total_pieces) if handle.have_piece(i))
+                percentage = (downloaded_pieces / total_pieces) * 100
+                self.log.info(f"下载统计: {downloaded_pieces} / {total_pieces} 个 pieces ({percentage:.2f}%) 已下载。")
+
         except asyncio.TimeoutError:
             self.log.error(f"Timeout during screenshot task for {infohash_hex}")
         except Exception:

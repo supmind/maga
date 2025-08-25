@@ -497,31 +497,30 @@ class ScreenshotService:
             timescale = 90000 # 如果无法从sidx中获取，使用一个常见的默认值
             self.log.warning(f"无法从sidx中精确获取timescale，使用默认值: {timescale}")
 
-        # 从所有关键帧中均匀选取约20个
-        keyframe_pts = [kf.pts for kf in all_keyframes]
-
+        # Bug 修复：旧逻辑基于目标时间戳查找关键帧，可能导致多个时间戳映射到同一个关键帧，从而截图数量不足。
+        # 新逻辑：直接从所有解析出的关键帧列表中均匀采样，确保唯一性和分布。
         if duration_sec > 3600:
             num_screenshots = int(duration_sec / 180)
         else:
             num_screenshots = 20
 
-        timestamp_secs = [(duration_sec / (num_screenshots + 1)) * (i + 1) for i in range(num_screenshots)]
+        if not all_keyframes:
+            return []
+
+        if len(all_keyframes) <= num_screenshots:
+            selected_keyframes = all_keyframes
+        else:
+            step = len(all_keyframes) / num_screenshots
+            selected_keyframes = [all_keyframes[int(i * step)] for i in range(num_screenshots)]
 
         valid_packet_infos = []
-        seen_pts = set()
-        for ts in timestamp_secs:
-            target_pts = int(ts * timescale)
-            insertion_point = bisect.bisect_right(keyframe_pts, target_pts)
-            if insertion_point > 0:
-                best_keyframe_index = insertion_point - 1
-                keyframe_info = all_keyframes[best_keyframe_index]
-
-                if keyframe_info.pts not in seen_pts:
-                    m, s = divmod(ts, 60)
-                    h, m = divmod(m, 60)
-                    timestamp_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
-                    valid_packet_infos.append((keyframe_info, timestamp_str))
-                    seen_pts.add(keyframe_info.pts)
+        for keyframe_info in selected_keyframes:
+            # 从关键帧自己的pts（presentation timestamp）计算时间戳，而不是从外部估算
+            ts_sec = keyframe_info.pts / timescale if timescale else 0
+            m, s = divmod(ts_sec, 60)
+            h, m = divmod(m, 60)
+            timestamp_str = f"{int(h):02d}:{int(m):02d}:{int(round(s)):02d}"
+            valid_packet_infos.append((keyframe_info, timestamp_str))
 
         self.log.info(f"为fMP4文件选择了 {len(valid_packet_infos)} 个截图点。")
         return valid_packet_infos
@@ -808,6 +807,13 @@ class ScreenshotService:
         这比扫描整个文件快得多，但依赖于视频容器有索引（例如MP4中的'moov' atom）。
         NOTE: 这是一个阻塞函数，应该在执行器中运行。
         """
+        # 开发者注意：此函数当前的实现基于一个对PyAV API的错误理解。
+        # `stream.index` 在现代PyAV中是一个整数（流的ID），而不是一个可迭代的帧索引列表。
+        # 因此，`list(stream.index)` 这行代码会抛出 TypeError。
+        # 除非找到一种新方法能在不完整下载文件的情况下从 'moov' box 中提取帧索引，
+        # 否则此函数（策略二）对于标准MP4文件是无效的。
+        # 目前的修复将集中在 fMP4 的路径上。
+        self.log.warning("注意：标准MP4的关键帧提取逻辑（策略二）可能由于PyAV API的变更而失效。")
         self.log.debug("正在尝试从视频索引中提取关键帧...")
         # torrent_reader 的位置可能在中间，需要重置
         torrent_reader.seek(0)

@@ -4,6 +4,7 @@ import logging
 import binascii
 import os
 import io
+import struct
 import av
 import libtorrent as lt
 import threading
@@ -92,6 +93,9 @@ class TorrentFileReader(io.RawIOBase):
                 self.piece_cache.move_to_end(piece_index) # Mark as recently used
             else:
                 # Cache miss: request the piece from the main thread
+                # 关键修复：在请求一个piece之前，必须把它设为高优先级，否则优先级为0的piece可能不会被下载。
+                self.handle.piece_priority(piece_index, 7)
+                self.log.debug(f"TorrentFileReader: 请求 piece {piece_index} (高优先级)")
                 future = Future()
                 call_read_piece = False
                 with self.service.read_lock:
@@ -103,7 +107,7 @@ class TorrentFileReader(io.RawIOBase):
                 if call_read_piece:
                     self.handle.read_piece(piece_index)
 
-                piece_data = future.result(timeout=60)
+                piece_data = future.result(timeout=300)
 
                 # Update cache
                 self.piece_cache[piece_index] = piece_data
@@ -289,6 +293,219 @@ class ScreenshotService:
             except Exception:
                 self.log.exception("Error in libtorrent alert loop.")
 
+    @staticmethod
+    def _parse_mp4_boxes(reader):
+        """
+        一个健壮的MP4 box解析器生成器。
+        它会读取box的大小和类型，然后跳过其内容，这对于快速扫描文件结构至关重要。
+        NOTE: 这是一个阻塞函数，应该在执行器中运行。
+        """
+        # 兼容 TorrentFileReader 和 BytesIO
+        try:
+            file_size = reader.file_size
+            reader.seek(0)
+        except AttributeError:
+            # BytesIO 对象没有 file_size，需要手动计算
+            reader.seek(0, io.SEEK_END)
+            file_size = reader.tell()
+            reader.seek(0)
+
+        while reader.tell() < file_size:
+            current_pos = reader.tell()
+            try:
+                header = reader.read(8)
+                if len(header) < 8:
+                    break
+
+                size, box_type_bytes = struct.unpack('>I4s', header)
+                box_type = box_type_bytes.decode('ascii', errors='ignore')
+
+                header_size = 8
+                if size == 1: # 64-bit size
+                    size_bytes = reader.read(8)
+                    if len(size_bytes) < 8:
+                        break
+                    size = struct.unpack('>Q', size_bytes)[0]
+                    header_size = 16
+                elif size == 0: # To end of file
+                    size = reader.file_size - current_pos
+
+                if size < header_size:
+                    break # Invalid size
+
+                content_pos = current_pos + header_size
+                content_size = size - header_size
+                yield box_type, content_pos, content_size
+
+                next_box_pos = current_pos + size
+                if next_box_pos <= current_pos:
+                    break
+                reader.seek(next_box_pos)
+
+            except (IOError, struct.error):
+                break
+
+    def _is_fmp4(self, torrent_reader):
+        """
+        通过检查 'moov' -> 'mvex' box 的存在来判断是否为 fMP4。
+        NOTE: 这是一个阻塞函数，应该在执行器中运行。
+        """
+        self.log.debug("正在检查文件是否为 fMP4...")
+        torrent_reader.seek(0)
+        try:
+            for box_type, content_pos, content_size in self._parse_mp4_boxes(torrent_reader):
+                if box_type == 'moov':
+                    self.log.debug(f"发现 'moov' box at {content_pos-8}, size {content_size+8}")
+                    torrent_reader.seek(content_pos)
+                    moov_content_reader = io.BytesIO(torrent_reader.read(content_size))
+                    for sub_box_type, _, _ in self._parse_mp4_boxes(moov_content_reader):
+                        if sub_box_type == 'mvex':
+                            self.log.info("在 'moov' box 中发现 'mvex' box，确认为 fMP4。")
+                            return True
+                    break
+        except Exception as e:
+            self.log.error(f"检查 fMP4 时出错: {e!r}", exc_info=True)
+
+        self.log.info("未发现 'mvex' box，文件被视为标准 MP4。")
+        return False
+
+    def _parse_sidx(self, reader, box_pos, box_size):
+        """解析sidx（Segment Index Box）。"""
+        reader.seek(box_pos)
+        sidx_data = io.BytesIO(reader.read(box_size))
+
+        version = int.from_bytes(sidx_data.read(1), 'big')
+        sidx_data.read(3) # flags
+
+        sidx_data.read(4) # reference_ID
+        timescale = int.from_bytes(sidx_data.read(4), 'big')
+
+        if version == 0:
+            earliest_presentation_time = int.from_bytes(sidx_data.read(4), 'big')
+            first_offset = int.from_bytes(sidx_data.read(4), 'big')
+        else:
+            earliest_presentation_time = int.from_bytes(sidx_data.read(8), 'big')
+            first_offset = int.from_bytes(sidx_data.read(8), 'big')
+
+        sidx_data.read(2) # reserved
+        reference_count = int.from_bytes(sidx_data.read(2), 'big')
+
+        references = []
+        current_pts = earliest_presentation_time
+        for _ in range(reference_count):
+            ref_header = sidx_data.read(4)
+            reference_size = int.from_bytes(ref_header, 'big') & 0x7FFFFFFF # 31 bits
+
+            subsegment_duration = int.from_bytes(sidx_data.read(4), 'big')
+
+            sap_header = sidx_data.read(4)
+            starts_with_sap = (sap_header[0] & 0x80) >> 7
+
+            references.append({
+                'size': reference_size,
+                'duration_pts': subsegment_duration,
+                'pts': current_pts,
+                'is_keyframe': bool(starts_with_sap)
+            })
+            current_pts += subsegment_duration
+
+        return references, timescale, first_offset
+
+    def _find_and_parse_keyframes_fmp4(self, torrent_reader):
+        """fMP4关键帧解析的核心逻辑。这是一个阻塞函数。"""
+        all_keyframes = []
+        total_duration_pts = 0
+        timescale = 0
+
+        torrent_reader.seek(0)
+        sidx_segments = []
+        sidx_timescale = 0
+        sidx_first_offset = 0
+        sidx_pos = 0
+        sidx_size = 0
+
+        # 1. 查找并解析 sidx box
+        for box_type, content_pos, content_size in self._parse_mp4_boxes(torrent_reader):
+            if box_type == 'sidx':
+                sidx_pos = content_pos - 8
+                sidx_size = content_size + 8
+                self.log.debug(f"发现 'sidx' box at {sidx_pos}, size {sidx_size}")
+                sidx_segments, sidx_timescale, sidx_first_offset = self._parse_sidx(torrent_reader, content_pos, content_size)
+                timescale = sidx_timescale
+                break
+
+        if not sidx_segments:
+            self.log.warning("在文件中未找到 'sidx' box。无法进行fMP4优化提取。")
+            return [], 0, 0
+
+        # sidx 中的 first_offset 是相对于 sidx box 自身结束位置的偏移量
+        data_start_offset = sidx_pos + sidx_size + sidx_first_offset
+
+        # 2. 从 sidx 引用中提取关键帧信息
+        current_offset = data_start_offset
+        for seg in sidx_segments:
+            if seg['is_keyframe']:
+                all_keyframes.append(KeyframeInfo(pts=seg['pts'], pos=current_offset, size=seg['size']))
+            total_duration_pts += seg['duration_pts']
+            current_offset += seg['size']
+
+        self.log.info(f"通过 sidx 解析发现 {len(all_keyframes)} 个潜在的关键帧段。")
+        duration_sec = total_duration_pts / timescale if timescale else 0
+        return all_keyframes, duration_sec, timescale
+
+    async def _extract_keyframes_fmp4(self, handle, video_file_index):
+        """
+        从fMP4文件中提取关键帧信息。
+        此方法通过按需读取和解析sidx box来定位关键帧，以实现最小化下载。
+        """
+        self.log.info("开始从fMP4文件中提取关键帧...")
+
+        # TorrentFileReader会按需下载数据，我们不需要预先下载整个文件。
+        # _find_and_parse_keyframes_fmp4 是一个阻塞函数，在执行器中运行。
+        # 它会使用 _parse_mp4_boxes，后者在调用 read() 时触发 TorrentFileReader 的下载逻辑。
+        torrent_reader = TorrentFileReader(self, handle, video_file_index)
+        all_keyframes, duration_sec, timescale = await self.loop.run_in_executor(
+            None, self._find_and_parse_keyframes_fmp4, torrent_reader
+        )
+
+        if not all_keyframes or duration_sec <= 0:
+            self.log.error("在fMP4文件中未能提取到任何关键帧或有效时长。")
+            return []
+
+        if timescale == 0:
+            timescale = 90000 # 如果无法从sidx中获取，使用一个常见的默认值
+            self.log.warning(f"无法从sidx中精确获取timescale，使用默认值: {timescale}")
+
+        # 从所有关键帧中均匀选取约20个
+        keyframe_pts = [kf.pts for kf in all_keyframes]
+
+        if duration_sec > 3600:
+            num_screenshots = int(duration_sec / 180)
+        else:
+            num_screenshots = 20
+
+        timestamp_secs = [(duration_sec / (num_screenshots + 1)) * (i + 1) for i in range(num_screenshots)]
+
+        valid_packet_infos = []
+        seen_pts = set()
+        for ts in timestamp_secs:
+            target_pts = int(ts * timescale)
+            insertion_point = bisect.bisect_right(keyframe_pts, target_pts)
+            if insertion_point > 0:
+                best_keyframe_index = insertion_point - 1
+                keyframe_info = all_keyframes[best_keyframe_index]
+
+                if keyframe_info.pts not in seen_pts:
+                    m, s = divmod(ts, 60)
+                    h, m = divmod(m, 60)
+                    timestamp_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
+                    valid_packet_infos.append((keyframe_info, timestamp_str))
+                    seen_pts.add(keyframe_info.pts)
+
+        self.log.info(f"为fMP4文件选择了 {len(valid_packet_infos)} 个截图点。")
+        return valid_packet_infos
+
+
     async def _wait_for_pieces(self, infohash_hex, handle, pieces_to_download):
         # Filter out pieces that are already downloaded to avoid waiting for nothing.
         pieces_to_actually_wait_for = {p for p in pieces_to_download if not handle.have_piece(p)}
@@ -373,14 +590,13 @@ class ScreenshotService:
             await asyncio.wait_for(future, timeout=180) # Increased timeout
             self.log.debug(f"Successfully received metadata for {infohash_hex}")
 
-            # 2. Find target video file
+            # 2. 查找目标视频文件
             ti = handle.get_torrent_info()
             total_pieces = ti.num_pieces()
 
-            # Set all pieces to priority 0 to prevent automatic downloading.
-            # We will then selectively set the priority for the pieces we need.
+            # 设置所有 piece 的优先级为 0，防止自动下载。
             handle.prioritize_pieces([0] * total_pieces)
-            self.log.debug(f"Set all {total_pieces} pieces to priority 0 to save bandwidth.")
+            self.log.debug(f"已将全部 {total_pieces} 个 piece 设置为优先级 0 以节约带宽。")
             video_file_index = -1
             target_file = None
             max_size = -1
@@ -391,112 +607,91 @@ class ScreenshotService:
                     target_file = f
 
             if video_file_index == -1:
-                self.log.warning(f"No video file found in torrent {infohash_hex}")
+                self.log.warning(f"在种子 {infohash_hex} 中未找到MP4视频文件。")
                 return
 
-            self.log.debug(f"Identified target video file: {target_file.path} (size: {target_file.size})")
+            self.log.debug(f"已确定目标视频文件: {target_file.path} (大小: {target_file.size})")
 
-            # 3. Prioritize and download file header
-            piece_size = ti.piece_length()
-            # Let's download a bit more for the header to be safe with various video formats
-            header_size_to_download = 5 * 1024 * 1024
-            # Ensure we don't try to download more than the file size
+            # 3. 下载少量数据用于文件类型检测
+            header_size_to_download = 64 * 1024 # 下载64KB用于检测
             header_size_to_download = min(header_size_to_download, target_file.size)
 
-            start_piece_req = ti.map_file(video_file_index, 0, 1)
-            # To get the end piece, we map the last byte of the range.
-            last_byte_offset = max(0, header_size_to_download - 1)
-            end_piece_req = ti.map_file(video_file_index, last_byte_offset, 1)
-            head_pieces = set(range(start_piece_req.piece, end_piece_req.piece + 1))
+            head_pieces = set()
+            if header_size_to_download > 0:
+                start_piece_req = ti.map_file(video_file_index, 0, 1)
+                end_piece_req = ti.map_file(video_file_index, header_size_to_download - 1, 1)
+                head_pieces = set(range(start_piece_req.piece, end_piece_req.piece + 1))
 
-            if not head_pieces:
-                self.log.warning(f"No header pieces to download for {target_file.path}. The file might be empty.")
-                return
+            if not head_pieces and target_file.size > 0:
+                self.log.warning(f"文件 {target_file.path} 过小，无法下载文件头。")
+                # 即使文件很小，我们仍然可以尝试处理它
 
-            for p in head_pieces:
-                handle.piece_priority(p, 7)
+            if head_pieces:
+                for p in head_pieces:
+                    handle.piece_priority(p, 7)
 
-            self.log.debug(f"Downloading header for {target_file.path} ({len(head_pieces)} pieces)...")
-            self.log.debug("Waiting for header pieces...")
-            await self._wait_for_pieces(infohash_hex, handle, head_pieces.copy())
-            self.log.debug("Header pieces finished.")
+                self.log.debug(f"正在下载文件头用于类型检测 ({len(head_pieces)} 个 piece)...")
+                await self._wait_for_pieces(infohash_hex, handle, head_pieces.copy())
+                self.log.debug("文件头下载完成。")
 
-            # Also download the footer, as the video index (moov atom) might be there.
-            footer_size_to_download = 5 * 1024 * 1024
-            footer_start_offset = max(0, target_file.size - footer_size_to_download)
+            # 4. 创建一个贯穿始终的TorrentFileReader实例
+            torrent_reader = TorrentFileReader(self, handle, video_file_index)
 
-            if footer_start_offset > header_size_to_download: # Avoid re-downloading if files are small
-                start_piece_req_foot = ti.map_file(video_file_index, footer_start_offset, 1)
-                end_piece_req_foot = ti.map_file(video_file_index, target_file.size - 1, 1)
-                foot_pieces = set(range(start_piece_req_foot.piece, end_piece_req_foot.piece + 1))
+            # 5. 判断文件类型并提取关键帧
+            is_fmp4 = await self.loop.run_in_executor(
+                None, self._is_fmp4, torrent_reader
+            )
 
-                if foot_pieces:
-                    for p in foot_pieces:
-                        handle.piece_priority(p, 7)
-                    self.log.debug(f"Downloading footer for {target_file.path} ({len(foot_pieces)} pieces)...")
-                    await self._wait_for_pieces(infohash_hex, handle, foot_pieces.copy())
-                    self.log.debug("Footer pieces finished.")
-
-            self.log.debug(f"Header and footer for {target_file.path} downloaded.")
-
-            # 4. Extract keyframe info using the video's index (fast method).
-            self.log.info("Attempting fast keyframe extraction using video index...")
             valid_packet_infos = []
-            try:
-                valid_packet_infos = await self.loop.run_in_executor(
-                    None, self._extract_keyframes_from_index, handle, video_file_index
+            if is_fmp4:
+                self.log.info("检测到 fMP4 文件。使用 fMP4 方法提取关键帧...")
+                valid_packet_infos = await self._extract_keyframes_fmp4(
+                    handle, video_file_index
                 )
-            except av.error.InvalidDataError:
-                self.log.warning("Caught InvalidDataError during fast extraction. Will attempt fallback.")
-                # valid_packet_infos remains empty, which will trigger the fallback.
-                pass
+            else:
+                self.log.info("文件为标准 MP4。下载文件头/尾部1MB以查找索引...")
 
-            # 5. If fast method fails, fall back to full scan (slow method).
+                ti = handle.get_torrent_info()
+                target_file = ti.files().at(video_file_index)
+
+                # 下载文件头1MB
+                header_size = 1 * 1024 * 1024
+                header_size = min(header_size, target_file.size)
+                head_pieces = set()
+                if header_size > 0:
+                    start_req = ti.map_file(video_file_index, 0, 1)
+                    end_req = ti.map_file(video_file_index, header_size - 1, 1)
+                    head_pieces = set(range(start_req.piece, end_req.piece + 1))
+
+                # 下载文件尾1MB
+                footer_size = 1 * 1024 * 1024
+                footer_start = max(0, target_file.size - footer_size)
+                foot_pieces = set()
+                # 只有当尾部不与头部重叠时才下载
+                if footer_start > header_size:
+                    start_req_foot = ti.map_file(video_file_index, footer_start, 1)
+                    end_req_foot = ti.map_file(video_file_index, target_file.size - 1, 1)
+                    foot_pieces = set(range(start_req_foot.piece, end_req_foot.piece + 1))
+
+                pieces_to_download = head_pieces.union(foot_pieces)
+                if pieces_to_download:
+                    self.log.debug(f"正在下载头/尾 pieces ({len(pieces_to_download)} 个)...")
+                    for p in pieces_to_download:
+                        handle.piece_priority(p, 7)
+                    await self._wait_for_pieces(infohash_hex, handle, pieces_to_download)
+                    self.log.debug("头/尾 pieces 下载完成。")
+
+                try:
+                    valid_packet_infos = await self.loop.run_in_executor(
+                        None, self._extract_keyframes_from_index, torrent_reader
+                    )
+                except av.error.InvalidDataError:
+                    self.log.warning("使用索引提取关键帧时发生错误，可能文件元数据不完整。")
+                    pass
+
+            # 5. 如果两种方法都失败了，则任务失败
             if not valid_packet_infos:
-                # NOTE: This fallback is a 'brute-force' method. It is much
-                # slower and uses more bandwidth than the fast extraction, as it
-                # may require downloading the entire video file to scan for
-                # keyframes. It is intended for files like fragmented MP4s or
-                # those without a proper index at the start/end of the file.
-                self.log.warning("Fast extraction failed. Falling back to full video scan (this may be slow)...")
-
-                # Get duration and all keyframes by scanning
-                duration_sec = await self.loop.run_in_executor(
-                    None, self._get_video_duration, handle, video_file_index
-                )
-                if not duration_sec or duration_sec <= 0:
-                    self.log.error(f"Could not get a valid video duration for {infohash_hex}. Stopping task.")
-                    return
-
-                all_keyframes, time_base = await self.loop.run_in_executor(
-                    None, self._get_all_keyframes, handle, video_file_index
-                )
-
-                if not all_keyframes or not time_base:
-                    self.log.error(f"Could not find any keyframes via full scan for {infohash_hex}.")
-                    return
-
-                # This logic is duplicated from the original implementation, used here for the fallback.
-                keyframe_pts = [kf.pts for kf in all_keyframes]
-                num_screenshots = 20
-                timestamp_secs = [(duration_sec / (num_screenshots + 1)) * (i + 1) for i in range(num_screenshots)]
-
-                for ts in timestamp_secs:
-                    target_pts = int(ts / time_base)
-                    insertion_point = bisect.bisect_right(keyframe_pts, target_pts)
-                    if insertion_point > 0:
-                        best_keyframe_index = insertion_point - 1
-                        keyframe_info = all_keyframes[best_keyframe_index]
-
-                        is_duplicate = any(info.pts == keyframe_info.pts for info, _ in valid_packet_infos)
-                        if not is_duplicate:
-                            m, s = divmod(ts, 60)
-                            h, m = divmod(m, 60)
-                            timestamp_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
-                            valid_packet_infos.append((keyframe_info, timestamp_str))
-
-            if not valid_packet_infos:
-                self.log.error(f"Could not map any timestamps to valid keyframes for {infohash_hex}.")
+                self.log.error(f"无法为 {infohash_hex} 提取任何有效关键帧。任务中止。")
                 return
 
             # 6. Prioritize all necessary pieces at once
@@ -560,16 +755,15 @@ class ScreenshotService:
             None, self._decode_and_save_frame, handle, video_file_index, keyframe_info, infohash_hex, timestamp_str
         )
 
-    def _extract_keyframes_from_index(self, handle, video_file_index):
+    def _extract_keyframes_from_index(self, torrent_reader):
         """
-        Extracts keyframe information using the video index if available.
-        This is much faster than scanning the whole file, but depends on the
-        video container having an index (e.g., the 'moov' atom in an MP4).
-
-        NOTE: This is a blocking function and should be run in an executor.
+        使用视频索引提取关键帧信息（如果可用）。
+        这比扫描整个文件快得多，但依赖于视频容器有索引（例如MP4中的'moov' atom）。
+        NOTE: 这是一个阻塞函数，应该在执行器中运行。
         """
-        self.log.debug("Attempting to extract keyframes from video index...")
-        torrent_reader = TorrentFileReader(self, handle, video_file_index)
+        self.log.debug("正在尝试从视频索引中提取关键帧...")
+        # torrent_reader 的位置可能在中间，需要重置
+        torrent_reader.seek(0)
         valid_packet_infos = []
 
         try:
@@ -678,29 +872,31 @@ class ScreenshotService:
 
     def _decode_and_save_frame(self, handle, video_file_index, keyframe_info, infohash_hex, timestamp_str):
         """
-        Decodes a single frame from a keyframe_info and saves it.
-        Assumes the necessary pieces are already downloaded.
-        NOTE: This is a blocking function.
+        解码并保存单个关键帧。
+        此函数现在更健壮，优先使用字节位置进行seek，这对于fMP4文件更可靠。
+        NOTE: 这是一个阻塞函数。
         """
-        self.log.debug(f"Decoding frame for timestamp {timestamp_str}")
+        self.log.debug(f"开始解码时间戳 {timestamp_str} 的帧 (位置: {keyframe_info.pos}, pts: {keyframe_info.pts})")
         torrent_reader = TorrentFileReader(self, handle, video_file_index)
         try:
             with av.open(torrent_reader) as container:
                 stream = container.streams.video[0]
-                container.seek(keyframe_info.pts, stream=stream)
+                # 优先使用字节位置进行seek，对于从sidx等box解析出的位置更精确
+                # any_frame=True 确保我们能解码找到的第一个帧，它应该就是我们目标的关键帧
+                container.seek(keyframe_info.pos, whence='byte', any_frame=True, stream=stream)
 
+                # 解码找到的第一个帧
                 for frame in container.decode(stream):
-                    if frame.pts >= keyframe_info.pts:
-                        output_filename = f"{self.output_dir}/{infohash_hex}_{timestamp_str.replace(':', '-')}.jpg"
-                        os.makedirs(self.output_dir, exist_ok=True)
-                        frame.to_image().save(output_filename)
-                        self.log.info(f"SUCCESS: Screenshot saved to {output_filename}")
-                        return
+                    output_filename = f"{self.output_dir}/{infohash_hex}_{timestamp_str.replace(':', '-')}.jpg"
+                    os.makedirs(self.output_dir, exist_ok=True)
+                    frame.to_image().save(output_filename)
+                    self.log.info(f"成功: 截图已保存到 {output_filename}")
+                    return
 
-                self.log.error(f"Failed to decode frame after re-seeking for timestamp {timestamp_str}")
+                self.log.error(f"解码失败: 在位置 {keyframe_info.pos} seek后未找到可解码的帧。")
 
         except Exception as e:
-            self.log.error(f"Error decoding frame for {timestamp_str}: {e!r}")
+            self.log.error(f"解码时间戳 {timestamp_str} 的帧时发生意外错误: {e!r}", exc_info=True)
 
     async def _worker(self):
         while self._running:

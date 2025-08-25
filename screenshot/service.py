@@ -439,55 +439,50 @@ class ScreenshotService:
 
             self.log.debug(f"Header and footer for {target_file.path} downloaded.")
 
-            # 4. Get video duration
-            duration_sec = await self.loop.run_in_executor(
-                None, self._get_video_duration, handle, video_file_index
-            )
-            if not duration_sec or duration_sec <= 0:
-                self.log.error(f"Could not get a valid video duration for {infohash_hex}. Stopping task.")
-                return
-
-            # 5. Scan for all keyframes and get the time_base in a single, reliable operation.
-            all_keyframes, time_base = await self.loop.run_in_executor(
-                None, self._get_all_keyframes, handle, video_file_index
+            # 4. Extract keyframe info using the video's index (fast method).
+            self.log.info("Attempting fast keyframe extraction using video index...")
+            valid_packet_infos = await self.loop.run_in_executor(
+                None, self._extract_keyframes_from_index, handle, video_file_index
             )
 
-            if not all_keyframes or not time_base:
-                self.log.error(f"Could not find any keyframes or get time_base for {infohash_hex}.")
-                return
+            # 5. If fast method fails, fall back to full scan (slow method).
+            if not valid_packet_infos:
+                self.log.warning("Fast extraction failed. Falling back to full video scan (this may be slow)...")
 
-            # Create a sorted list of keyframe presentation timestamps (pts) for efficient searching.
-            keyframe_pts = [kf.pts for kf in all_keyframes]
+                # Get duration and all keyframes by scanning
+                duration_sec = await self.loop.run_in_executor(
+                    None, self._get_video_duration, handle, video_file_index
+                )
+                if not duration_sec or duration_sec <= 0:
+                    self.log.error(f"Could not get a valid video duration for {infohash_hex}. Stopping task.")
+                    return
 
-            # For each desired timestamp, find the best keyframe (the last one before or at the timestamp)
-            num_screenshots = 20
-            timestamp_secs = [(duration_sec / (num_screenshots + 1)) * (i + 1) for i in range(num_screenshots)]
+                all_keyframes, time_base = await self.loop.run_in_executor(
+                    None, self._get_all_keyframes, handle, video_file_index
+                )
 
-            valid_packet_infos = []
-            for ts in timestamp_secs:
-                target_pts = int(ts / time_base)
-                # Find the insertion point for target_pts in the sorted list of keyframe PTS
-                # This gives us the index of the first keyframe *after* our target time.
-                insertion_point = bisect.bisect_right(keyframe_pts, target_pts)
+                if not all_keyframes or not time_base:
+                    self.log.error(f"Could not find any keyframes via full scan for {infohash_hex}.")
+                    return
 
-                # The keyframe we want is the one *before* the insertion point.
-                if insertion_point > 0:
-                    best_keyframe_index = insertion_point - 1
-                    keyframe_info = all_keyframes[best_keyframe_index]
+                # This logic is duplicated from the original implementation, used here for the fallback.
+                keyframe_pts = [kf.pts for kf in all_keyframes]
+                num_screenshots = 20
+                timestamp_secs = [(duration_sec / (num_screenshots + 1)) * (i + 1) for i in range(num_screenshots)]
 
-                    # To avoid getting the same early frame for multiple early timestamps,
-                    # we make sure we haven't used this keyframe already.
-                    is_duplicate = False
-                    for info, _ in valid_packet_infos:
-                        if info.pts == keyframe_info.pts:
-                            is_duplicate = True
-                            break
+                for ts in timestamp_secs:
+                    target_pts = int(ts / time_base)
+                    insertion_point = bisect.bisect_right(keyframe_pts, target_pts)
+                    if insertion_point > 0:
+                        best_keyframe_index = insertion_point - 1
+                        keyframe_info = all_keyframes[best_keyframe_index]
 
-                    if not is_duplicate:
-                        m, s = divmod(ts, 60)
-                        h, m = divmod(m, 60)
-                        timestamp_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
-                        valid_packet_infos.append((keyframe_info, timestamp_str))
+                        is_duplicate = any(info.pts == keyframe_info.pts for info, _ in valid_packet_infos)
+                        if not is_duplicate:
+                            m, s = divmod(ts, 60)
+                            h, m = divmod(m, 60)
+                            timestamp_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
+                            valid_packet_infos.append((keyframe_info, timestamp_str))
 
             if not valid_packet_infos:
                 self.log.error(f"Could not map any timestamps to valid keyframes for {infohash_hex}.")
@@ -553,6 +548,70 @@ class ScreenshotService:
         await self.loop.run_in_executor(
             None, self._decode_and_save_frame, handle, video_file_index, keyframe_info, infohash_hex, timestamp_str
         )
+
+    def _extract_keyframes_from_index(self, handle, video_file_index, num_screenshots=20):
+        """
+        Extracts keyframe information using the video index if available.
+        This is much faster than scanning the whole file, but depends on the
+        video container having an index (e.g., the 'moov' atom in an MP4).
+
+        NOTE: This is a blocking function and should be run in an executor.
+        """
+        self.log.debug("Attempting to extract keyframes from video index...")
+        torrent_reader = TorrentFileReader(self, handle, video_file_index)
+        valid_packet_infos = []
+
+        try:
+            with av.open(torrent_reader) as container:
+                stream = container.streams.video[0]
+                if not stream.index:
+                    self.log.warning("Video stream has no index. Cannot use fast keyframe extraction.")
+                    return []
+
+                duration_sec = container.duration / 1_000_000.0
+                if not duration_sec or duration_sec <= 0:
+                    self.log.error("Could not determine a valid video duration.")
+                    return []
+
+                self.log.debug(f"Video duration: {duration_sec:.2f}s. Index has {len(stream.index)} entries.")
+
+                # We are interested in keyframes, which are a subset of index entries.
+                # PyAV's `is_keyframe` on index entries is not reliably exposed.
+                # However, seeking to a time with `any_frame=False` finds keyframes.
+                # A simpler approach that works if the index is roughly linear is to
+                # treat all index entries as potential keyframe candidates and select from them.
+                # This is a good balance of performance and simplicity.
+                index_entries = list(stream.index)
+
+                # Create a sorted list of presentation timestamps (pts) for efficient searching.
+                entry_pts = [e.pts for e in index_entries]
+
+                timestamp_secs = [(duration_sec / (num_screenshots + 1)) * (i + 1) for i in range(num_screenshots)]
+                time_base = stream.time_base
+                seen_pts = set()
+
+                for ts in timestamp_secs:
+                    target_pts = int(ts / time_base)
+                    insertion_point = bisect.bisect_right(entry_pts, target_pts)
+
+                    if insertion_point > 0:
+                        best_entry_index = insertion_point - 1
+                        entry = index_entries[best_entry_index]
+
+                        if entry.pts not in seen_pts:
+                            keyframe_info = KeyframeInfo(pts=entry.pts, pos=entry.pos, size=entry.size)
+                            m, s = divmod(ts, 60)
+                            h, m = divmod(m, 60)
+                            timestamp_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
+                            valid_packet_infos.append((keyframe_info, timestamp_str))
+                            seen_pts.add(entry.pts)
+
+            self.log.info(f"Successfully extracted {len(valid_packet_infos)} keyframe positions from index.")
+            return valid_packet_infos
+
+        except Exception as e:
+            self.log.error(f"Could not extract keyframes from index: {e!r}. This might happen if the video metadata (moov atom) is not in the header/footer.", exc_info=True)
+            return []
 
     def _get_video_duration(self, handle, video_file_index):
         """

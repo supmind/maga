@@ -803,77 +803,155 @@ class ScreenshotService:
 
     def _extract_keyframes_from_index(self, torrent_reader):
         """
-        使用视频索引提取关键帧信息（如果可用）。
-        这比扫描整个文件快得多，但依赖于视频容器有索引（例如MP4中的'moov' atom）。
+        使用手动解析视频索引的方式提取关键帧信息。
+        这避免了使用PyAV的局限性，并能直接从`moov` box中提取关键帧列表。
         NOTE: 这是一个阻塞函数，应该在执行器中运行。
         """
-        # 开发者注意：此函数当前的实现基于一个对PyAV API的错误理解。
-        # `stream.index` 在现代PyAV中是一个整数（流的ID），而不是一个可迭代的帧索引列表。
-        # 因此，`list(stream.index)` 这行代码会抛出 TypeError。
-        # 除非找到一种新方法能在不完整下载文件的情况下从 'moov' box 中提取帧索引，
-        # 否则此函数（策略二）对于标准MP4文件是无效的。
-        # 目前的修复将集中在 fMP4 的路径上。
-        self.log.warning("注意：标准MP4的关键帧提取逻辑（策略二）可能由于PyAV API的变更而失效。")
-        self.log.debug("正在尝试从视频索引中提取关键帧...")
-        # torrent_reader 的位置可能在中间，需要重置
-        torrent_reader.seek(0)
-        valid_packet_infos = []
-
+        self.log.debug("正在尝试从视频索引中手动提取关键帧...")
         try:
-            with av.open(torrent_reader) as container:
-                stream = container.streams.video[0]
-                if not stream.index:
-                    self.log.warning("Video stream has no index. Cannot use fast keyframe extraction.")
-                    return []
+            from .pymp4parse import F4VParser
 
-                duration_sec = container.duration / 1_000_000.0
-                if not duration_sec or duration_sec <= 0:
-                    self.log.error("Could not determine a valid video duration.")
-                    return []
+            torrent_reader.seek(0)
+            data = torrent_reader.read()
+            if not data:
+                self.log.warning("TorrentFileReader 未提供任何数据用于索引解析。")
+                return []
 
-                if duration_sec > 3600:
-                    num_screenshots = int(duration_sec / 180)
-                else:
-                    num_screenshots = 20
+            moov_box = next((b for b in F4VParser.parse(bytes_input=data) if b.header.box_type == 'moov'), None)
+            if not moov_box:
+                self.log.error("在已下载的数据中未找到 'moov' box。")
+                return []
 
-                self.log.debug(f"Video duration: {duration_sec:.2f}s. Index has {len(stream.index)} entries.")
+            # 假设第一个轨道是视频轨道
+            path_to_stbl = ['trak', 'mdia', 'minf', 'stbl']
+            stbl_box = F4VParser.find_child_box(moov_box, path_to_stbl)
+            if not stbl_box:
+                self.log.error("未能找到 stbl box。")
+                return []
 
-                # We are interested in keyframes, which are a subset of index entries.
-                # PyAV's `is_keyframe` on index entries is not reliably exposed.
-                # However, seeking to a time with `any_frame=False` finds keyframes.
-                # A simpler approach that works if the index is roughly linear is to
-                # treat all index entries as potential keyframe candidates and select from them.
-                # This is a good balance of performance and simplicity.
-                index_entries = list(stream.index)
+            # 提取所有需要的表
+            stss = getattr(stbl_box, 'stss', None) # Sync Sample (Keyframes)
+            stts = getattr(stbl_box, 'stts', None) # Time To Sample
+            stsc = getattr(stbl_box, 'stsc', None) # Sample To Chunk
+            stsz = getattr(stbl_box, 'stsz', None) # Sample Size
+            stco = getattr(stbl_box, 'stco', None) # Chunk Offset
+            co64 = getattr(stbl_box, 'co64', None) # 64-bit Chunk Offset
 
-                # Create a sorted list of presentation timestamps (pts) for efficient searching.
-                entry_pts = [e.pts for e in index_entries]
+            if not all([stss, stts, stsc, stsz, (stco or co64)]):
+                self.log.error("stbl box 中缺少必要的原子来计算关键帧信息。")
+                return []
 
-                timestamp_secs = [(duration_sec / (num_screenshots + 1)) * (i + 1) for i in range(num_screenshots)]
-                time_base = stream.time_base
-                seen_pts = set()
+            keyframe_samples = stss.entries
+            chunk_offsets = stco.entries if stco else co64.entries
 
-                for ts in timestamp_secs:
-                    target_pts = int(ts / time_base)
-                    insertion_point = bisect.bisect_right(entry_pts, target_pts)
+            # --- 构建从样本到信息的查找表 ---
 
-                    if insertion_point > 0:
-                        best_entry_index = insertion_point - 1
-                        entry = index_entries[best_entry_index]
+            # 1. 样本 -> 大小
+            sample_sizes = stsz.entries if stsz.sample_size == 0 else [stsz.sample_size] * stsz.sample_count
 
-                        if entry.pts not in seen_pts:
-                            keyframe_info = KeyframeInfo(pts=entry.pts, pos=entry.pos, size=entry.size)
-                            m, s = divmod(ts, 60)
-                            h, m = divmod(m, 60)
-                            timestamp_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
-                            valid_packet_infos.append((keyframe_info, timestamp_str))
-                            seen_pts.add(entry.pts)
+            # 2. 样本 -> 时间戳 (pts)
+            sample_timestamps = []
+            current_time = 0
+            for count, duration in stts.entries:
+                for _ in range(count):
+                    sample_timestamps.append(current_time)
+                    current_time += duration
 
-            self.log.info(f"Successfully extracted {len(valid_packet_infos)} keyframe positions from index.")
+            # 3. 样本 -> 字节偏移 (pos)
+            sample_offsets = []
+            stsc_entries = stsc.entries
+            chunk_iter = 0
+            sample_in_chunk_iter = 0
+
+            # 创建一个更容易使用的 sample-to-chunk 查找
+            sample_to_chunk_map = []
+            for i in range(len(stsc_entries)):
+                start_chunk = stsc_entries[i][0]
+                samples_per_chunk = stsc_entries[i][1]
+                # description_id = stsc_entries[i][2] # not needed for this
+
+                end_chunk = stsc_entries[i+1][0] if i + 1 < len(stsc_entries) else len(chunk_offsets) + 1
+
+                for _ in range(start_chunk - 1, end_chunk - 1):
+                    sample_to_chunk_map.append(samples_per_chunk)
+
+            current_offset = 0
+            current_chunk_index = -1
+            for i in range(len(sample_sizes)):
+                sample_num = i + 1
+
+                # 找到这个样本所在的 chunk
+                chunk_index_for_sample = 0
+                samples_processed = 0
+                for j, samples_per_chunk in enumerate(sample_to_chunk_map):
+                    if sample_num <= samples_processed + samples_per_chunk:
+                        chunk_index_for_sample = j
+                        break
+                    samples_processed += samples_per_chunk
+
+                if chunk_index_for_sample != current_chunk_index:
+                    current_chunk_index = chunk_index_for_sample
+                    current_offset = chunk_offsets[current_chunk_index]
+
+                    # 计算到这个样本为止，在当前 chunk 内的偏移
+                    samples_in_previous_chunks = sum(sample_to_chunk_map[:current_chunk_index])
+                    for k in range(samples_in_previous_chunks, i):
+                        current_offset += sample_sizes[k]
+
+                sample_offsets.append(current_offset)
+                current_offset += sample_sizes[i]
+
+            # --- 从关键帧样本号构建 KeyframeInfo ---
+            all_keyframes = []
+            for kf_sample_num in keyframe_samples:
+                index = kf_sample_num - 1 # 样本号从1开始，列表索引从0开始
+                if index < len(sample_offsets) and index < len(sample_timestamps) and index < len(sample_sizes):
+                    all_keyframes.append(KeyframeInfo(
+                        pts=sample_timestamps[index],
+                        pos=sample_offsets[index],
+                        size=sample_sizes[index]
+                    ))
+
+            if not all_keyframes:
+                self.log.error("成功解析了stbl表，但未能构建任何KeyframeInfo对象。")
+                return []
+
+            self.log.info(f"成功从 'moov' box 手动解析出 {len(all_keyframes)} 个关键帧。")
+
+            # --- 均匀采样 ---
+            path_to_tkhd = ['trak', 'tkhd'] # Track Header for duration
+            tkhd_box = F4VParser.find_child_box(moov_box, path_to_tkhd)
+            duration = tkhd_box.duration if tkhd_box else sum(e[0] * e[1] for e in stts.entries)
+
+            path_to_mdhd = ['trak', 'mdia', 'mdhd'] # Media Header for timescale
+            mdhd_box = F4VParser.find_child_box(moov_box, path_to_mdhd)
+            timescale = mdhd_box.timescale if mdhd_box else 1000 # Fallback
+
+            duration_sec = duration / timescale if timescale else 0
+
+            if duration_sec > 3600:
+                num_screenshots = int(duration_sec / 180)
+            else:
+                num_screenshots = 20
+
+            if len(all_keyframes) <= num_screenshots:
+                selected_keyframes = all_keyframes
+            else:
+                step = len(all_keyframes) / num_screenshots
+                selected_keyframes = [all_keyframes[int(i * step)] for i in range(num_screenshots)]
+
+            valid_packet_infos = []
+            for keyframe_info in selected_keyframes:
+                ts_sec = keyframe_info.pts / timescale if timescale else 0
+                m, s = divmod(ts_sec, 60)
+                h, m = divmod(m, 60)
+                timestamp_str = f"{int(h):02d}:{int(m):02d}:{int(round(s)):02d}"
+                valid_packet_infos.append((keyframe_info, timestamp_str))
+
             return valid_packet_infos
 
         except Exception as e:
-            self.log.error(f"Could not extract keyframes from index: {e!r}. This might happen if the video metadata (moov atom) is not in the header/footer.", exc_info=True)
+            self.log.error(f"手动从索引提取关键帧时发生错误: {e!r}", exc_info=True)
             return []
 
     def _get_video_duration(self, handle, video_file_index):

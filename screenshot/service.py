@@ -399,7 +399,7 @@ class ScreenshotService:
             # 3. Prioritize and download file header
             piece_size = ti.piece_length()
             # Let's download a bit more for the header to be safe with various video formats
-            header_size_to_download = 2 * 1024 * 1024
+            header_size_to_download = 5 * 1024 * 1024
             # Ensure we don't try to download more than the file size
             header_size_to_download = min(header_size_to_download, target_file.size)
 
@@ -441,11 +441,59 @@ class ScreenshotService:
 
             # 4. Extract keyframe info using the video's index (fast method).
             self.log.info("Attempting fast keyframe extraction using video index...")
-            valid_packet_infos = await self.loop.run_in_executor(
-                None, self._extract_keyframes_from_index, handle, video_file_index
-            )
+            valid_packet_infos = []
+            try:
+                valid_packet_infos = await self.loop.run_in_executor(
+                    None, self._extract_keyframes_from_index, handle, video_file_index
+                )
+            except av.error.InvalidDataError:
+                self.log.warning("Caught InvalidDataError during fast extraction. Will attempt fallback.")
+                # valid_packet_infos remains empty, which will trigger the fallback.
+                pass
 
             # 5. If fast method fails, fall back to full scan (slow method).
+            if not valid_packet_infos:
+                # NOTE: This fallback is a 'brute-force' method. It is much
+                # slower and uses more bandwidth than the fast extraction, as it
+                # may require downloading the entire video file to scan for
+                # keyframes. It is intended for files like fragmented MP4s or
+                # those without a proper index at the start/end of the file.
+                self.log.warning("Fast extraction failed. Falling back to full video scan (this may be slow)...")
+
+                # Get duration and all keyframes by scanning
+                duration_sec = await self.loop.run_in_executor(
+                    None, self._get_video_duration, handle, video_file_index
+                )
+                if not duration_sec or duration_sec <= 0:
+                    self.log.error(f"Could not get a valid video duration for {infohash_hex}. Stopping task.")
+                    return
+
+                all_keyframes, time_base = await self.loop.run_in_executor(
+                    None, self._get_all_keyframes, handle, video_file_index
+                )
+
+                if not all_keyframes or not time_base:
+                    self.log.error(f"Could not find any keyframes via full scan for {infohash_hex}.")
+                    return
+
+                # This logic is duplicated from the original implementation, used here for the fallback.
+                keyframe_pts = [kf.pts for kf in all_keyframes]
+                num_screenshots = 20
+                timestamp_secs = [(duration_sec / (num_screenshots + 1)) * (i + 1) for i in range(num_screenshots)]
+
+                for ts in timestamp_secs:
+                    target_pts = int(ts / time_base)
+                    insertion_point = bisect.bisect_right(keyframe_pts, target_pts)
+                    if insertion_point > 0:
+                        best_keyframe_index = insertion_point - 1
+                        keyframe_info = all_keyframes[best_keyframe_index]
+
+                        is_duplicate = any(info.pts == keyframe_info.pts for info, _ in valid_packet_infos)
+                        if not is_duplicate:
+                            m, s = divmod(ts, 60)
+                            h, m = divmod(m, 60)
+                            timestamp_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
+                            valid_packet_infos.append((keyframe_info, timestamp_str))
 
             if not valid_packet_infos:
                 self.log.error(f"Could not map any timestamps to valid keyframes for {infohash_hex}.")

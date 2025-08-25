@@ -13,10 +13,13 @@ from concurrent.futures import Future
 
 KeyframeInfo = namedtuple('KeyframeInfo', ['pts', 'pos', 'size'])
 
+
 class LibtorrentError(Exception):
+    """自定义异常，用于传递来自 libtorrent 的特定错误。"""
     def __init__(self, error_code):
         self.error_code = error_code
         super().__init__(f"Libtorrent error: {error_code.message()}")
+
 
 # ==============================================================================
 # TorrentFileReader: A file-like object for reading from a torrent
@@ -94,12 +97,14 @@ class TorrentFileReader(io.RawIOBase):
             else:
                 # Cache miss: request the piece from the main thread
                 # 关键修复：在请求一个piece之前，必须把它设为高优先级，否则优先级为0的piece可能不会被下载。
+                # 关键修复：在请求一个piece之前，必须把它设为高优先级，否则优先级为0的piece可能不会被下载。
                 self.handle.piece_priority(piece_index, 7)
                 self.log.debug(f"TorrentFileReader: 请求 piece {piece_index} (高优先级)")
                 future = Future()
                 call_read_piece = False
-                with self.service.read_lock:
-                    # If we are the first to request this piece, we trigger the read.
+                # 使用新的锁来确保线程安全
+                with self.service.pending_reads_lock:
+                    # 如果我们是第一个请求这个 piece 的，我们就触发 read_piece 调用
                     if not self.service.pending_reads[piece_index]:
                         call_read_piece = True
                     self.service.pending_reads[piece_index].append(future)
@@ -107,7 +112,13 @@ class TorrentFileReader(io.RawIOBase):
                 if call_read_piece:
                     self.handle.read_piece(piece_index)
 
-                piece_data = future.result(timeout=300)
+                try:
+                    # 健壮性修复：捕获可能由 _handle_read_piece 设置的异常
+                    piece_data = future.result(timeout=300)
+                except LibtorrentError as e:
+                    self.log.error(f"TorrentFileReader: 从主线程获取 piece {piece_index} 失败: {e}")
+                    # 将 LibtorrentError 转换为 IOError，这是文件类接口的标准做法
+                    raise IOError(f"读取 piece {piece_index} 失败，libtorrent 错误: {e.error_code.message()}") from e
 
                 # Update cache
                 self.piece_cache[piece_index] = piece_data
@@ -164,7 +175,7 @@ class ScreenshotService:
         # Each waiter tracks a future and how many pieces that future is waiting for.
         self.piece_to_waiters = defaultdict(list)
         self.pending_reads = defaultdict(list)
-        self.read_lock = threading.Lock()
+        self.pending_reads_lock = threading.Lock()
 
     async def run(self):
         self.log.info("Starting Screenshot Service...")
@@ -247,11 +258,21 @@ class ScreenshotService:
         self.log.debug(f"Received tracker reply for {alert.handle.info_hash()}. Found {alert.num_peers} peers.")
 
     def _handle_read_piece(self, alert):
-        with self.read_lock:
-            # There might be multiple futures waiting for the same piece
+        # 关键修复：使用与 TorrentFileReader 中相同的锁，以防止竞态条件
+        with self.pending_reads_lock:
+            # 可能会有多个 future 在等待同一个 piece
             futures = self.pending_reads.pop(alert.piece, [])
 
-        # The `alert.error` is unreliable. We assume the buffer is valid.
+        # 健壮性修复：检查 alert 中是否存在错误
+        if alert.error:
+            self.log.error(f"读取 piece {alert.piece} 失败: {alert.error.message()}")
+            # 将异常设置到 future 上，以便 TorrentFileReader 可以捕获它
+            error = LibtorrentError(alert.error)
+            for future in futures:
+                if not future.done():
+                    future.set_exception(error)
+            return
+
         data = bytes(alert.buffer)
         for future in futures:
             if not future.done():
@@ -506,6 +527,104 @@ class ScreenshotService:
         return valid_packet_infos
 
 
+    async def _extract_keyframes_strategically(self, handle, video_file_index, infohash_hex):
+        """
+        使用多种策略智能地提取关键帧信息，以提高成功率并遵守最小化下载原则。
+        此函数会按顺序尝试最高效的策略。
+        """
+        self.log.info("开始策略性关键帧提取...")
+        ti = handle.get_torrent_info()
+        target_file = ti.files().at(video_file_index)
+        # 创建一个贯穿此函数始终的 TorrentFileReader 实例
+        torrent_reader = TorrentFileReader(self, handle, video_file_index)
+
+        # --- 策略一: 尝试作为 fMP4 使用 sidx box 解析 ---
+        self.log.info("策略一: 尝试通过 fMP4/sidx 方法提取关键帧...")
+        # 我们需要下载少量数据来检查文件类型和查找 sidx。
+        # 假设 sidx (如果存在) 会在文件的前 64KB 内。
+        header_size_to_download = 64 * 1024
+        header_size_to_download = min(header_size_to_download, target_file.size)
+
+        head_pieces = set()
+        if header_size_to_download > 0:
+            start_piece_req = ti.map_file(video_file_index, 0, 1)
+            end_piece_req = ti.map_file(video_file_index, header_size_to_download - 1, 1)
+            head_pieces = set(range(start_piece_req.piece, end_piece_req.piece + 1))
+
+            # 设置高优先级并等待 piece 下载完成
+            for p in head_pieces:
+                handle.piece_priority(p, 7)
+            self.log.debug(f"策略一: 正在下载文件头 ({len(head_pieces)} 个 piece) 以查找 sidx...")
+            await self._wait_for_pieces(infohash_hex, handle, head_pieces.copy())
+            self.log.debug("文件头下载完成。")
+
+        # 检查是否是 fMP4 并尝试用 sidx 提取
+        is_fmp4 = await self.loop.run_in_executor(None, self._is_fmp4, torrent_reader)
+        if is_fmp4:
+            # _extract_keyframes_fmp4 会使用已下载的数据进行解析
+            valid_packet_infos = await self._extract_keyframes_fmp4(handle, video_file_index)
+            if valid_packet_infos:
+                self.log.info("策略一成功: 通过 fMP4/sidx 方法成功提取到关键帧。")
+                return valid_packet_infos, head_pieces, set()
+
+        self.log.info("策略一失败或不适用。转至策略二。")
+
+        # --- 策略二: 尝试作为标准 MP4 使用 moov box 索引 ---
+        self.log.info("策略二: 尝试通过文件头/尾的索引 (moov) 提取关键帧...")
+
+        # 下载文件头和尾部各 1MB
+        header_size = 1 * 1024 * 1024
+        header_size = min(header_size, target_file.size)
+
+        # 计算头部的 pieces (可能部分已在策略一中下载)
+        head_pieces_for_moov = set()
+        if header_size > 0:
+            start_req = ti.map_file(video_file_index, 0, 1)
+            end_req = ti.map_file(video_file_index, header_size - 1, 1)
+            head_pieces_for_moov = set(range(start_req.piece, end_req.piece + 1))
+
+        # 下载文件尾1MB
+        footer_size = 1 * 1024 * 1024
+        footer_start = max(0, target_file.size - footer_size)
+        foot_pieces = set()
+        # 只有当尾部不与头部重叠时才下载
+        if footer_start > header_size:
+            start_req_foot = ti.map_file(video_file_index, footer_start, 1)
+            end_req_foot = ti.map_file(video_file_index, target_file.size - 1, 1)
+            foot_pieces = set(range(start_req_foot.piece, end_req_foot.piece + 1))
+
+        # 合并所有需要下载的 pieces，并设置优先级
+        pieces_to_download = head_pieces_for_moov.union(foot_pieces)
+        # 排除掉在策略一中已经下载过的 piece
+        pieces_to_download.difference_update(head_pieces)
+
+        if pieces_to_download:
+            self.log.debug(f"策略二: 正在下载额外的头/尾 pieces ({len(pieces_to_download)} 个)...")
+            for p in pieces_to_download:
+                handle.piece_priority(p, 7)
+            await self._wait_for_pieces(infohash_hex, handle, pieces_to_download)
+            self.log.debug("头/尾 pieces 下载完成。")
+
+        try:
+            # 使用 TorrentFileReader (它会利用已下载的数据)
+            valid_packet_infos = await self.loop.run_in_executor(
+                None, self._extract_keyframes_from_index, torrent_reader
+            )
+            if valid_packet_infos:
+                self.log.info("策略二成功: 通过 moov 索引成功提取到关键帧。")
+                downloaded_pieces = head_pieces.union(head_pieces_for_moov).union(foot_pieces)
+                return valid_packet_infos, downloaded_pieces, foot_pieces
+            else:
+                 self.log.warning("策略二警告: 调用索引提取函数后未返回任何关键帧。")
+        except av.error.InvalidDataError:
+            self.log.warning("策略二失败: 使用索引提取关键帧时发生 av.error.InvalidDataError，可能元数据不完整。")
+            pass
+
+        self.log.error("所有关键帧提取策略均失败。")
+        # 返回空结果，表示失败
+        return [], set(), set()
+
+
     async def _wait_for_pieces(self, infohash_hex, handle, pieces_to_download):
         # Filter out pieces that are already downloaded to avoid waiting for nothing.
         pieces_to_actually_wait_for = {p for p in pieces_to_download if not handle.have_piece(p)}
@@ -612,89 +731,17 @@ class ScreenshotService:
 
             self.log.debug(f"已确定目标视频文件: {target_file.path} (大小: {target_file.size})")
 
-            # 3. 下载少量数据用于文件类型检测
-            header_size_to_download = 64 * 1024 # 下载64KB用于检测
-            header_size_to_download = min(header_size_to_download, target_file.size)
-
-            head_pieces = set()
-            if header_size_to_download > 0:
-                start_piece_req = ti.map_file(video_file_index, 0, 1)
-                end_piece_req = ti.map_file(video_file_index, header_size_to_download - 1, 1)
-                head_pieces = set(range(start_piece_req.piece, end_piece_req.piece + 1))
-
-            if not head_pieces and target_file.size > 0:
-                self.log.warning(f"文件 {target_file.path} 过小，无法下载文件头。")
-                # 即使文件很小，我们仍然可以尝试处理它
-
-            if head_pieces:
-                for p in head_pieces:
-                    handle.piece_priority(p, 7)
-
-                self.log.debug(f"正在下载文件头用于类型检测 ({len(head_pieces)} 个 piece)...")
-                await self._wait_for_pieces(infohash_hex, handle, head_pieces.copy())
-                self.log.debug("文件头下载完成。")
-
-            # 4. 创建一个贯穿始终的TorrentFileReader实例
-            torrent_reader = TorrentFileReader(self, handle, video_file_index)
-
-            # 5. 判断文件类型并提取关键帧
-            is_fmp4 = await self.loop.run_in_executor(
-                None, self._is_fmp4, torrent_reader
+            # 3. 使用新的策略性方法提取关键帧
+            valid_packet_infos, head_pieces, foot_pieces = await self._extract_keyframes_strategically(
+                handle, video_file_index, infohash_hex
             )
 
-            valid_packet_infos = []
-            if is_fmp4:
-                self.log.info("检测到 fMP4 文件。使用 fMP4 方法提取关键帧...")
-                valid_packet_infos = await self._extract_keyframes_fmp4(
-                    handle, video_file_index
-                )
-            else:
-                self.log.info("文件为标准 MP4。下载文件头/尾部1MB以查找索引...")
-
-                ti = handle.get_torrent_info()
-                target_file = ti.files().at(video_file_index)
-
-                # 下载文件头1MB
-                header_size = 1 * 1024 * 1024
-                header_size = min(header_size, target_file.size)
-                head_pieces = set()
-                if header_size > 0:
-                    start_req = ti.map_file(video_file_index, 0, 1)
-                    end_req = ti.map_file(video_file_index, header_size - 1, 1)
-                    head_pieces = set(range(start_req.piece, end_req.piece + 1))
-
-                # 下载文件尾1MB
-                footer_size = 1 * 1024 * 1024
-                footer_start = max(0, target_file.size - footer_size)
-                foot_pieces = set()
-                # 只有当尾部不与头部重叠时才下载
-                if footer_start > header_size:
-                    start_req_foot = ti.map_file(video_file_index, footer_start, 1)
-                    end_req_foot = ti.map_file(video_file_index, target_file.size - 1, 1)
-                    foot_pieces = set(range(start_req_foot.piece, end_req_foot.piece + 1))
-
-                pieces_to_download = head_pieces.union(foot_pieces)
-                if pieces_to_download:
-                    self.log.debug(f"正在下载头/尾 pieces ({len(pieces_to_download)} 个)...")
-                    for p in pieces_to_download:
-                        handle.piece_priority(p, 7)
-                    await self._wait_for_pieces(infohash_hex, handle, pieces_to_download)
-                    self.log.debug("头/尾 pieces 下载完成。")
-
-                try:
-                    valid_packet_infos = await self.loop.run_in_executor(
-                        None, self._extract_keyframes_from_index, torrent_reader
-                    )
-                except av.error.InvalidDataError:
-                    self.log.warning("使用索引提取关键帧时发生错误，可能文件元数据不完整。")
-                    pass
-
-            # 5. 如果两种方法都失败了，则任务失败
+            # 4. 如果两种方法都失败了，则任务失败
             if not valid_packet_infos:
                 self.log.error(f"无法为 {infohash_hex} 提取任何有效关键帧。任务中止。")
                 return
 
-            # 6. Prioritize all necessary pieces at once
+            # 5. Prioritize all necessary pieces at once
             all_pieces_needed = set()
             pieces_per_keyframe = []
             for keyframe_info, timestamp_str in valid_packet_infos:

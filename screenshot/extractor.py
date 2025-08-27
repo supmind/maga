@@ -302,7 +302,7 @@ class H264KeyframeExtractor:
 
         log.info(f"正在提取第 {keyframe_index} 个关键帧: 样本索引={target_sample.index}, 偏移={target_sample.offset}, 大小={target_sample.size}")
 
-        await self.reader.seek(target_sample.offset)
+        self.reader.seek(target_sample.offset)
         sample_data = await self.reader.read(target_sample.size)
 
         if len(sample_data) != target_sample.size:

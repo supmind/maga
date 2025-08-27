@@ -97,8 +97,22 @@ class H264KeyframeExtractor:
         Parses the MP4 structure from the moov box to find the video track and build a sample map.
         This logic is adapted from the user-provided robust implementation.
         """
-        # The entry point is the moov box itself, which is already in self.moov_stream
         moov_payload = self.moov_stream
+        log.info(f"开始解析 'moov' box。总大小: {len(moov_payload.getbuffer())} 字节。")
+
+        # --- Start Diagnostic Logging ---
+        all_moov_children = []
+        moov_payload.seek(0)
+        try:
+            # Create a temporary stream for diagnostic parsing to not affect the main stream's state
+            diag_stream = BytesIO(moov_payload.read())
+            moov_payload.seek(0) # IMPORTANT: reset original stream
+            for t_type, _ in self._parse_boxes(diag_stream):
+                all_moov_children.append(t_type)
+            log.info(f"诊断日志: 'moov' box 包含的顶级子 atoms: {all_moov_children}")
+        except Exception as e:
+            log.error(f"诊断日志: 解析 'moov' 子-box 时发生错误: {e}")
+        # --- End Diagnostic Logging ---
 
         # 1. Find the video track ('trak')
         trak_payload = None

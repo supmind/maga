@@ -141,15 +141,41 @@ class VideoFile:
         if moov_data:
             return moov_data
 
-        # Probe at the end
+        # Probe at the end, using reverse search
         if file_size > PROBE_SIZE:
             seek_pos = max(0, file_size - PROBE_SIZE)
             self.log.debug(f"正在文件的末尾 {PROBE_SIZE} 字节中探测 'moov' box (从 {seek_pos} 开始)。")
             reader.seek(seek_pos)
             tail_data = await reader.read(PROBE_SIZE)
-            moov_data = await find_moov_in_chunk(tail_data, seek_pos)
-            if moov_data:
-                return moov_data
+
+            # Reverse search for 'moov' box signature
+            search_pos = len(tail_data)
+            while search_pos >= 8:
+                found_pos = tail_data.rfind(b'moov', 0, search_pos)
+                if found_pos == -1:
+                    self.log.debug("在当前块中通过反向搜索未找到 'moov' 签名。")
+                    break
+
+                size_pos = found_pos - 4
+                if size_pos < 0:
+                    search_pos = found_pos
+                    continue
+
+                try:
+                    size = struct.unpack('>I', tail_data[size_pos:found_pos])[0]
+                    if size >= 8 and (size_pos + size) <= len(tail_data):
+                        self.log.info(f"在偏移量 {seek_pos + size_pos} 处通过反向搜索找到 'moov' box。")
+                        return tail_data[size_pos : size_pos + size]
+                except struct.error:
+                    pass
+
+                search_pos = found_pos
+
+            # Fallback to original forward scan on the tail chunk if reverse search fails
+            self.log.debug("反向搜索 'moov' 失败，回退到对尾部块的顺序扫描。")
+            moov_data_fallback = await find_moov_in_chunk(tail_data, seek_pos)
+            if moov_data_fallback:
+                return moov_data_fallback
 
         self.log.error("在文件中未找到 'moov' box。")
         return None

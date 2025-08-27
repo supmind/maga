@@ -97,26 +97,37 @@ class H264KeyframeExtractor:
         Parses the MP4 structure from the moov box to find the video track and build a sample map.
         This logic is adapted from the user-provided robust implementation.
         """
-        moov_payload = self.moov_stream
-        log.info(f"开始解析 'moov' box。总大小: {len(moov_payload.getbuffer())} 字节。")
+        stream = self.moov_stream
+        log.info(f"开始解析 'moov' box。总大小: {len(stream.getbuffer())} 字节。")
 
-        # --- Start Diagnostic Logging ---
-        all_moov_children = []
+        # The data passed to the extractor is the complete 'moov' atom (header + payload).
+        # Some files might have a nested 'moov' atom. We need to unwrap it to get to the
+        # payload that contains the 'trak' atoms.
+        stream.seek(0)
+        # Peek at the box type to see if we need to unwrap.
+        size, box_type = struct.unpack('>I4s', stream.read(8))
+        stream.seek(0) # Reset after peeking.
+
+        if box_type == b'moov':
+            log.info("检测到 'moov' box 容器，将解析其 payload。")
+            # The stream *is* the moov box. We need to parse its payload.
+            # _parse_boxes yields the payload as a new BytesIO stream.
+            found_inner = False
+            for b_type, payload in self._parse_boxes(stream):
+                if b_type == 'moov':
+                    stream = payload # The new stream to parse is the payload of the outer moov.
+                    found_inner = True
+                    break
+            if not found_inner:
+                # This should not happen if the peek was correct, but as a safeguard:
+                raise ValueError("Could not extract payload from outer 'moov' box.")
+
+        # By this point, `stream` should hold the actual content with trak/mvhd etc.
+        moov_payload = stream
         moov_payload.seek(0)
-        try:
-            # Create a temporary stream for diagnostic parsing to not affect the main stream's state
-            diag_stream = BytesIO(moov_payload.read())
-            moov_payload.seek(0) # IMPORTANT: reset original stream
-            for t_type, _ in self._parse_boxes(diag_stream):
-                all_moov_children.append(t_type)
-            log.info(f"诊断日志: 'moov' box 包含的顶级子 atoms: {all_moov_children}")
-        except Exception as e:
-            log.error(f"诊断日志: 解析 'moov' 子-box 时发生错误: {e}")
-        # --- End Diagnostic Logging ---
 
         # 1. Find the video track ('trak')
         trak_payload = None
-        # The user's code iterates through top-level boxes in moov. We can do the same.
         for t_type, t_payload_iter in self._parse_boxes(moov_payload):
             if t_type == 'trak':
                 # To check if it's a video track, we need to check its handler type.
@@ -134,6 +145,12 @@ class H264KeyframeExtractor:
                         break # Use the first video track found
 
         if not trak_payload:
+            # For better debugging, let's log what we *did* find.
+            all_children = []
+            moov_payload.seek(0)
+            for t, _ in self._parse_boxes(moov_payload):
+                all_children.append(t)
+            log.error(f"在 'moov' 的 payload 中未找到视频轨道。找到的 box: {all_children}")
             raise ValueError("在 'moov' Box 中未找到有效的视频轨道。")
 
         # 2. Get timescale from 'mdhd'

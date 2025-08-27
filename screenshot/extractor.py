@@ -282,10 +282,13 @@ class H264KeyframeExtractor:
                 sample_idx += 1
 
         self.samples = samples
+
+        keyframe_samples = [s for s in self.samples if s.is_keyframe]
         self.keyframes = [
             Keyframe(i, s.index, s.pts, self.timescale)
-            for i, s in enumerate(samples) if s.is_keyframe
+            for i, s in enumerate(keyframe_samples)
         ]
+
         log.info(f"完成采样地图构建。共找到 {len(self.samples)} 个样本，其中 {len(self.keyframes)} 个是关键帧。")
 
     async def get_keyframe_packet(self, keyframe_index: int) -> Tuple[Optional[bytes], bytes]:

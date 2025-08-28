@@ -75,9 +75,11 @@ class H264KeyframeExtractor:
 
         try:
             self._parse_structure()
-        except Exception as e:
-            log.error(f"解析 'moov' box 时发生严重错误: {e}", exc_info=True)
+        except (ValueError, struct.error, IndexError) as e:
+            # 捕获预期的解析错误（如无效的 box 结构、数据不完整等）
+            log.error(f"解析 'moov' box 时发生可预见的错误: {e}", exc_info=True)
             # 即使解析失败，也允许对象创建，但其内部状态将是空的，以避免上层调用崩溃。
+            # 其他意外的异常（如 MemoryError）将正常传播，这是一种更好的实践。
             pass
 
     def _parse_boxes(self, stream: BinaryIO) -> Generator[Tuple[str, BytesIO], None, None]:

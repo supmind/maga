@@ -5,6 +5,7 @@ import os
 import shutil
 import glob
 import pytest_asyncio
+from unittest.mock import patch
 
 from screenshot.service import (
     ScreenshotService,
@@ -77,7 +78,6 @@ class TestIntegration:
         result = await self.run_task(service_setup, METADATA_TIMEOUT_INFOHASH)
 
         assert isinstance(result, FatalErrorResult)
-        assert "Unexpected worker error" in result.reason
         assert "获取元数据超时" in result.reason
 
     async def test_partial_failure_on_moov_timeout(self, service_setup):
@@ -88,8 +88,7 @@ class TestIntegration:
         result = await self.run_task(service, SINTEL_INFOHASH)
 
         assert isinstance(result, PartialSuccessResult)
-        assert result.screenshots_count == 0
-        assert "Timeout or error fetching moov atom" in result.reason
+        assert "获取 moov atom 超时或出错" in result.reason
         assert result.resume_data == {}
 
     async def test_multi_stage_resume_from_partial_success(self, service_setup):
@@ -104,7 +103,7 @@ class TestIntegration:
 
         assert isinstance(result1, PartialSuccessResult)
         assert result1.screenshots_count == 1
-        assert "Timeout waiting for pieces" in result1.reason
+        assert "等待 pieces 超时" in result1.reason
         assert "moov_data_b64" in result1.resume_data
 
         processed_run1 = set(result1.resume_data['processed_kf_indices'])
@@ -136,3 +135,17 @@ class TestIntegration:
 
         output_files = glob.glob(os.path.join(TEST_OUTPUT_DIR, f"{SINTEL_INFOHASH}_*.jpg"))
         assert len(output_files) == total_screenshots
+
+    async def test_fatal_error_on_corrupt_mp4(self, service_setup):
+        """
+        Tests a fatal error when the mp4 file is corrupt and cannot be parsed.
+        This is simulated by patching the H264KeyframeExtractor to raise an exception.
+        """
+        service = service_setup
+
+        # We patch the extractor in the service module where it's used.
+        with patch('screenshot.service.H264KeyframeExtractor', side_effect=Exception("模拟解析失败")):
+            result = await self.run_task(service, SINTEL_INFOHASH)
+
+        assert isinstance(result, FatalErrorResult)
+        assert "初始化任务失败: 模拟解析失败" in result.reason

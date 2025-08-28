@@ -5,6 +5,7 @@ H264KeyframeExtractor 的单元测试。
 import pytest
 import struct
 from pathlib import Path
+from unittest.mock import patch
 from screenshot.extractor import H264KeyframeExtractor
 
 # 获取当前测试文件的目录
@@ -163,3 +164,63 @@ class TestH264KeyframeExtractor:
         assert len(extractor.samples) == 0
         assert len(extractor.keyframes) == 0
         assert extractor.extradata is None
+
+
+class TestH264KeyframeExtractorEdgeCases:
+    """针对 H264KeyframeExtractor 的边缘情况和无效输入的测试。"""
+
+    def test_init_fails_gracefully_with_no_stbl(self, minimal_moov_builder):
+        """测试：当 'stbl' box 缺失时，提取器应失败但不会崩溃。"""
+        # GIVEN: 一个没有 'stbl' box 的 moov box
+        # 通过传递一个空字典来构建一个不含 stbl 的 minf
+        minf_box = build_box(b'minf', b'')
+        mdia_box = build_box(b'mdia', build_box(b'hdlr', b'\x00'*8 + b'vide' + b'\x00'*12) + minf_box)
+        trak_box = build_box(b'trak', mdia_box)
+        moov_box = build_box(b'moov', trak_box)
+
+        # WHEN: 使用此数据初始化
+        # THEN: 它应该记录一个错误并返回一个空实例
+        with patch('screenshot.extractor.log') as mock_log:
+            extractor = H264KeyframeExtractor(moov_box)
+            assert len(extractor.samples) == 0
+            assert len(extractor.keyframes) == 0
+            mock_log.error.assert_called_once()
+            assert "在视频轨道中未找到 'stbl' Box" in mock_log.error.call_args[0][0]
+
+    def test_init_fails_gracefully_with_no_video_track(self):
+        """测试：当 moov box 中没有视频轨道 ('trak' with 'vide' handler) 时。"""
+        # GIVEN: 一个只有音轨的 moov box
+        hdlr_payload = b'\x00\x00\x00\x00\x00\x00\x00\x00' + b'soun' + b'\x00'*12 # 'soun' handler
+        hdlr_box = build_box(b'hdlr', hdlr_payload)
+        mdia_box = build_box(b'mdia', hdlr_box)
+        trak_box = build_box(b'trak', mdia_box)
+        moov_box = build_box(b'moov', trak_box)
+
+        # WHEN: 使用此数据初始化
+        # THEN: 它应该记录一个错误并返回一个空实例
+        with patch('screenshot.extractor.log') as mock_log:
+            extractor = H264KeyframeExtractor(moov_box)
+            assert len(extractor.samples) == 0
+            assert len(extractor.keyframes) == 0
+            mock_log.error.assert_called_once()
+            assert "在 'moov' Box 中未找到有效的视频轨道" in mock_log.error.call_args[0][0]
+
+    def test_init_fails_gracefully_with_missing_critical_stbl_child(self, minimal_moov_builder):
+        """测试：当 'stbl' 缺少一个关键子 box (如 stsz) 时。"""
+        # GIVEN: 一个 'stbl' 缺少 'stsz' 的 moov box
+        stbl_tables = {
+            # stsz is missing
+            b'stco': b'\x00\x00\x00\x00' + struct.pack('>I', 1) + struct.pack('>I', 1000),
+            b'stsc': b'\x00\x00\x00\x00' + struct.pack('>I', 1) + struct.pack('>III', 1, 3, 1),
+            b'stts': b'\x00\x00\x00\x00' + struct.pack('>I', 1) + struct.pack('>II', 3, 1000),
+            b'stss': b'\x00\x00\x00\x00' + struct.pack('>I', 1) + struct.pack('>I', 1),
+        }
+        moov_box_data = minimal_moov_builder(stbl_tables)
+
+        # WHEN & THEN: 它应该能处理这个错误并返回一个空实例
+        with patch('screenshot.extractor.log') as mock_log:
+            extractor = H264KeyframeExtractor(moov_box_data)
+            assert len(extractor.samples) == 0
+            assert len(extractor.keyframes) == 0
+            # 错误可能在解析时被捕获，所以检查日志
+            assert mock_log.error.called

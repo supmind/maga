@@ -84,12 +84,12 @@ class ScreenshotGenerator:
             # 我们只取解码出的第一帧来生成截图。
             self._save_frame_to_jpeg(frames[0], infohash_hex, timestamp_str)
 
-        except av.error.InvalidDataError as e:
-            # 捕获 PyAV 特定的数据错误，这通常表示码流损坏。
-            self.log.error(f"解码器报告无效数据 (时间戳: {timestamp_str}): {e}")
+        except av.AVError as e:
+            # 捕获所有 PyAV 相关的错误，如无效数据、解码器错误等
+            self.log.error(f"解码器为 {timestamp_str} 报告错误: {e}")
         except Exception as e:
-            # 捕获所有其他异常，以确保工作线程不会崩溃，并记录详细信息。
-            self.log.exception(f"为帧 {timestamp_str} 进行同步解码/保存时出错")
+            # 捕获其他意外错误（如文件系统权限问题），但允许关键错误（如 KeyboardInterrupt）传播
+            self.log.exception(f"为帧 {timestamp_str} 进行同步解码/保存时发生意外错误")
             raise e
 
     async def generate(self, extradata: Optional[bytes], packet_data: bytes, infohash_hex: str, timestamp_str: str):

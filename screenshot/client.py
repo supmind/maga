@@ -35,10 +35,10 @@ class TorrentClient:
             'listen_interfaces': '0.0.0.0:6881',
             'enable_dht': True,
             'alert_mask': (
-    lt.alert_category.error_notification |
-    lt.alert_category.status_notification |
-    lt.alert_category.storage_notification |
-    lt.alert_category.progress_notification
+        lt.alert_category.error |
+        lt.alert_category.status |
+        lt.alert_category.storage |
+        lt.alert_category.piece_progress
 ),
             'dht_bootstrap_nodes': 'dht.libtorrent.org:25401,router.bittorrent.com:6881,dht.transmissionbt.com:6881,router.utorrent.com:6881,router.bt.ouinet.work:6881',
             'user_agent': 'qBittorrent/4.5.2',

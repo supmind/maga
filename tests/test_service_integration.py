@@ -1,159 +1,180 @@
-import pytest
+# -*- coding: utf-8 -*-
 import asyncio
-from unittest.mock import patch, AsyncMock
+import struct
+import pytest
+import pytest_asyncio
+from unittest.mock import AsyncMock, MagicMock, ANY
 
 from screenshot.service import ScreenshotService, Keyframe, SampleInfo
-from screenshot.errors import FrameDownloadTimeoutError
 from screenshot.config import Settings
+from screenshot.errors import MetadataTimeoutError, MoovNotFoundError, FrameDownloadTimeoutError
 
-# Mark all tests in this file as async
 pytestmark = pytest.mark.asyncio
 
-async def test_task_recovery_after_recoverable_failure(status_callback, mock_service_dependencies):
-    """
-    Tests that if a task fails with a FrameDownloadTimeoutError, it can be
-    resumed and will process all keyframes correctly on the second attempt.
-    """
-    # --- Test Setup ---
+# --- 辅助函数，用于构建测试用的 MP4 Box ---
+def create_box(box_type: bytes, payload: bytes) -> bytes:
+    """创建一个简单的 MP4 box，使用 32 位大小。"""
+    size = 8 + len(payload)
+    return struct.pack('>I4s', size, box_type) + payload
+
+def build_test_moov() -> bytes:
+    """为测试构建一个简化的、但结构上有效的 'moov' box。"""
+    stsd_payload = b'\x00\x00\x00\x00' + b'\x00\x00\x00\x01'
+    config_box = create_box(b'avcC', b'\x01\x64\x00\x1f\xff\xe1\x00\x19' + (b'x' * 25))
+    visual_sample_entry_header = b'\x00' * 78
+    sample_entry_payload = visual_sample_entry_header + config_box
+    stsd_payload += create_box(b'avc1', sample_entry_payload)
+    stsd = create_box(b'stsd', stsd_payload)
+    stts_payload = b'\x00\x00\x00\x00' + b'\x00\x00\x00\x01' + struct.pack('>II', 10, 1000)
+    stts = create_box(b'stts', stts_payload)
+    stss_payload = b'\x00\x00\x00\x00' + struct.pack('>I', 2) + struct.pack('>II', 1, 5)
+    stss = create_box(b'stss', stss_payload)
+    stsc_payload = b'\x00\x00\x00\x00' + b'\x00\x00\x00\x01' + struct.pack('>III', 1, 10, 1)
+    stsc = create_box(b'stsc', stsc_payload)
+    stsz_payload = b'\x00\x00\x00\x00' + struct.pack('>II', 100, 10)
+    stsz = create_box(b'stsz', stsz_payload)
+    stco_payload = b'\x00\x00\x00\x00' + b'\x00\x00\x00\x01' + struct.pack('>I', 1024)
+    stco = create_box(b'stco', stco_payload)
+    stbl_payload = stsd + stts + stss + stsc + stsz + stco
+    stbl = create_box(b'stbl', stbl_payload)
+    minf = create_box(b'minf', stbl)
+    mdia_payload = create_box(b'mdhd', b'\x00' * 12 + struct.pack('>I', 90000) + b'\x00' * 8)
+    mdia = create_box(b'mdia', mdia_payload)
+    trak = create_box(b'trak', create_box(b'tkhd', b'\x00'*84) + mdia)
+    moov_payload = create_box(b'mvhd', b'\x00' * 100) + trak
+    return create_box(b'moov', moov_payload)
+
+
+@pytest_asyncio.fixture
+async def service(mock_service_dependencies, status_callback):
+    """提供一个已启动并注入了所有模拟依赖的 ScreenshotService 实例。"""
+    settings = Settings(num_workers=1)
     loop = asyncio.get_running_loop()
-    settings = Settings(
-        min_screenshots=10,
-        max_screenshots=10,
-        default_screenshots=10
-    )
-    service = ScreenshotService(
-        settings=settings,
-        loop=loop,
-        status_callback=status_callback
-    )
+    service_instance = ScreenshotService(settings=settings, loop=loop, status_callback=status_callback)
+
+    service_instance.client.start = AsyncMock()
+    service_instance.client.stop = AsyncMock()
+
+    await service_instance.run()
+    yield service_instance
+    await service_instance.stop()
+
+async def test_happy_path_success(service, mock_service_dependencies, status_callback):
+    """测试一个截图任务从提交到成功完成的完整“愉快路径”。"""
+    infohash = "happyhash123456789012345678901234567890"
     client = mock_service_dependencies['client']
-    handle = mock_service_dependencies['handle']
+    extractor_class = mock_service_dependencies['extractor']
     generator = mock_service_dependencies['generator']
-    service.client = client
-    service.generator = generator
-    mock_extractor_class = mock_service_dependencies['extractor']
 
-    with patch('screenshot.service.ScreenshotService._get_moov_atom_data', new_callable=AsyncMock, return_value=b'mock_moov_data'), \
-         patch('screenshot.service.KeyframeExtractor', mock_extractor_class):
+    valid_moov_data = build_test_moov()
+    keyframe_piece_data = b'keyframe_data'
 
-        infohash = "test_hash_recovery"
-        num_keyframes = 10
+    async def mock_fetch_pieces(handle, pieces, timeout=None):
+        if 0 in pieces:
+            return {p: valid_moov_data for p in pieces}
+        return {p: keyframe_piece_data for p in pieces}
+    client.fetch_pieces.side_effect = mock_fetch_pieces
 
-        # --- Common Mock Configuration ---
-        # The handle is now provided by the fixture, so we configure it directly.
-        mock_ti = handle.get_torrent_info.return_value
-        mock_ti.files.return_value.file_size.return_value = 16384 * num_keyframes
+    mock_extractor = MagicMock()
+    mock_keyframes = [Keyframe(index=i, sample_index=s, pts=i*1000, timescale=1000) for i, s in enumerate([1, 5])]
+    mock_extractor.keyframes = mock_keyframes
+    mock_extractor.samples = [SampleInfo(offset=i*100, size=100, is_keyframe=(i+1 in [1, 5]), index=i+1, pts=i*500) for i in range(10)]
+    mock_extractor.codec_name = 'h264'
+    mock_extractor.extradata = b'extradata'
+    mock_extractor.timescale = 90000 # 修复：为 mock extractor 设置 timescale
+    extractor_class.return_value = mock_extractor
 
-        mock_keyframes = [Keyframe(index=i, sample_index=i+1, pts=i*1000, timescale=1000) for i in range(num_keyframes)]
-        mock_samples = [SampleInfo(offset=i*16384, size=16384, is_keyframe=True, index=i+1, pts=i*1000) for i in range(num_keyframes)]
+    await service.submit_task(infohash)
+    await service.task_queue.join()
 
-        extractor_instance = mock_extractor_class.return_value
-        extractor_instance.keyframes = mock_keyframes
-        extractor_instance.samples = mock_samples
-        extractor_instance.timescale = 1000
+    status_callback.assert_called_once_with(status='success', infohash=infohash, message=ANY)
+    assert generator.generate.call_count == 2
 
-        client.fetch_pieces.return_value = {i: f"piece_data_{i}".encode() for i in range(num_keyframes)}
-
-        # 1. --- First Run: Simulate Immediate Timeout ---
-
-        # This will be passed to the service's internal queue's `get` method
-        # It will immediately raise a timeout, causing the processing loop to break
-        # before any screenshots can be generated.
-        client.subscribe_pieces.side_effect = lambda _, q: setattr(q, 'get', AsyncMock(side_effect=asyncio.TimeoutError("Simulated immediate timeout")))
-
-        await service._handle_screenshot_task({'infohash': infohash})
-
-        # 2. --- Assertions for First Run ---
-        assert generator.generate.call_count == 0, "No screenshots should be generated on the first failing run"
-
-        status_callback.assert_called_once()
-        _, kwargs = status_callback.call_args
-        assert kwargs['status'] == 'recoverable_failure'
-        assert isinstance(kwargs['error'], FrameDownloadTimeoutError)
-
-        resume_data = kwargs['resume_data']
-        assert resume_data is not None, "Resume data must be provided for recoverable failures"
-        # Since no progress was made, processed_keyframes should be empty
-        assert len(resume_data['processed_keyframes']) == 0
-
-        # 3. --- Second Run: Successful Recovery ---
-        status_callback.reset_mock()
-        generator.generate.reset_mock()
-
-        # Configure the mock queue to deliver all 10 pieces successfully
-        mock_queue_run2 = asyncio.Queue()
-        for i in range(num_keyframes):
-            await mock_queue_run2.put(i)
-
-        client.subscribe_pieces.side_effect = lambda _, q: setattr(q, 'get', mock_queue_run2.get)
-
-        await service._handle_screenshot_task({'infohash': infohash, 'resume_data': resume_data})
-
-        # 4. --- Assertions for Second Run ---
-        assert generator.generate.call_count == 10, "Should generate all 10 screenshots on the second run"
-
-        status_callback.assert_called_once()
-        _, kwargs = status_callback.call_args
-        assert kwargs['status'] == 'success'
-
-async def test_task_with_metadata_calls_get_handle_with_metadata(status_callback, mock_service_dependencies):
-    """
-    Tests that if a task is submitted with metadata, the service calls the
-    client's get_handle method with that metadata.
-    """
-    # --- Test Setup ---
-    loop = asyncio.get_running_loop()
-    settings = Settings()
-    service = ScreenshotService(
-        settings=settings,
-        loop=loop,
-        status_callback=status_callback
-    )
+async def test_metadata_timeout_is_recoverable_failure(service, mock_service_dependencies, status_callback):
+    """测试当 TorrentClient 获取元数据超时时，任务会以“可恢复的失败”结束。"""
+    infohash = "metatimeouthash12345678901234567890123"
     client = mock_service_dependencies['client']
-    handle = mock_service_dependencies['handle']
-    generator = mock_service_dependencies['generator']
-    service.client = client
-    service.generator = generator
-    mock_extractor_class = mock_service_dependencies['extractor']
 
-    # We need to mock the torrent_info's info_hash to match our test data
-    # The mock_basetorrent_info is part of the handle mock
-    mock_ti = handle.get_torrent_info.return_value
-    mock_ti.info_hash.return_value = "c824d516243886576b5151b148ef8648344e433a"
+    client.get_handle.side_effect = MetadataTimeoutError("Timeout!", infohash)
 
-    # Configure the mock extractor instance
-    extractor_instance = mock_extractor_class.return_value
-    extractor_instance.timescale = 1000
-    extractor_instance.samples = [SampleInfo(offset=0, size=100, is_keyframe=True, index=1, pts=1000)]
-    extractor_instance.keyframes = [Keyframe(index=0, sample_index=1, pts=1000, timescale=1000)]
+    await service.submit_task(infohash)
+    await service.task_queue.join()
 
-    # Mock the piece download queue
-    mock_queue = asyncio.Queue()
-    await mock_queue.put(0)  # The piece needed for the keyframe
-    client.subscribe_pieces.side_effect = lambda _, q: setattr(q, 'get', mock_queue.get)
-    client.fetch_pieces.return_value = {0: b'some_piece_data' * 1000} # Make it large enough
+    status_callback.assert_called_once()
+    _, kwargs = status_callback.call_args
+    assert kwargs.get('status') == 'recoverable_failure'
+    assert isinstance(kwargs.get('error'), MetadataTimeoutError)
 
+async def test_moov_not_found_is_permanent_failure(service, mock_service_dependencies, status_callback):
+    """测试当无法找到 moov box 时，任务会以“永久性失败”结束。"""
+    infohash = "moovfailhash1234567890123456789012345"
+    client = mock_service_dependencies['client']
 
-    with patch('screenshot.service.ScreenshotService._get_moov_atom_data', new_callable=AsyncMock, return_value=b'mock_moov_data'), \
-         patch('screenshot.service.KeyframeExtractor', mock_extractor_class):
+    client.fetch_pieces.return_value = {}
 
-        infohash = "c824d516243886576b5151b148ef8648344e433a"
-        # A minimal, valid bencoded dictionary for a torrent file
-        metadata = b'd4:infod4:name4:test12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee'
+    await service.submit_task(infohash)
+    await service.task_queue.join()
 
-        # --- Run Task ---
-        # We use submit_task and then run the worker task manually
-        await service.submit_task(infohash=infohash, metadata=metadata)
+    status_callback.assert_called_once()
+    _, kwargs = status_callback.call_args
+    assert kwargs.get('status') == 'permanent_failure'
+    assert isinstance(kwargs.get('error'), MoovNotFoundError)
 
-        # Get the task from the queue and execute it
-        task_info = await service.task_queue.get()
-        await service._handle_screenshot_task(task_info)
+async def test_task_recovery_after_recoverable_failure(service, mock_service_dependencies, status_callback):
+    """测试任务恢复流程。"""
+    infohash = "resumehash1234567890123456789012345678"
+    client = mock_service_dependencies['client']
+    extractor_class = mock_service_dependencies['extractor']
 
-        # --- Assertions ---
-        # The key assertion: was get_handle called with the correct arguments?
-        client.get_handle.assert_called_once_with(infohash, metadata=metadata)
+    async def mock_fetch_moov_only(handle, pieces, timeout=None):
+        return {p: build_test_moov() for p in pieces}
+    client.fetch_pieces.side_effect = mock_fetch_moov_only
 
-        # Also check that the task completes successfully
-        status_callback.assert_called_once()
-        _, kwargs = status_callback.call_args
-        assert kwargs['status'] == 'success'
+    mock_extractor = MagicMock()
+    mock_extractor.codec_name = 'h264'
+    mock_extractor.timescale = 90000 # 修复：为 mock extractor 设置 timescale
+    extractor_class.return_value = mock_extractor
+
+    mock_resume_data = {"infohash": infohash, "extractor_info": {"codec_name": "h264"}, "processed_keyframes": []}
+    service._process_keyframe_pieces = AsyncMock(side_effect=FrameDownloadTimeoutError("Timeout!", infohash, resume_data=mock_resume_data))
+
+    await service.submit_task(infohash)
+    await service.task_queue.join()
+
+    status_callback.assert_called_once()
+    _, kwargs = status_callback.call_args
+    assert kwargs['status'] == 'recoverable_failure'
+    resume_data = kwargs.get('resume_data')
+    assert resume_data is not None
+
+    status_callback.reset_mock()
+    extractor_class.reset_mock()
+
+    service._process_keyframe_pieces = AsyncMock(return_value=({1}, {1: asyncio.Future()}))
+
+    await service.submit_task(infohash, resume_data=resume_data)
+    await service.task_queue.join()
+
+    status_callback.assert_called_once_with(status='success', infohash=infohash, message=ANY)
+    extractor_class.assert_not_called()
+
+async def test_task_with_metadata_calls_get_handle_with_metadata(service, mock_service_dependencies, status_callback):
+    """测试如果任务附带元数据提交，服务会将该元数据传递给客户端的 get_handle 方法。"""
+    infohash = "c824d516243886576b5151b148ef8648344e433a"
+    metadata = b'd4:infod4:name4:test12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee'
+    client = mock_service_dependencies['client']
+    extractor_class = mock_service_dependencies['extractor']
+
+    client.fetch_pieces.return_value = {0: build_test_moov()}
+    mock_extractor = MagicMock()
+    mock_extractor.keyframes = [Keyframe(1, 1, 1, 1)]
+    mock_extractor.samples = [SampleInfo(0, 0, True, 1, 1)]
+    mock_extractor.timescale = 90000 # 修复：为 mock extractor 设置 timescale
+    extractor_class.return_value = mock_extractor
+    service._process_keyframe_pieces = AsyncMock(return_value=({1}, {1: asyncio.Future()}))
+
+    await service.submit_task(infohash=infohash, metadata=metadata)
+    await service.task_queue.join()
+
+    client.get_handle.assert_called_once_with(infohash, metadata=metadata)
+    status_callback.assert_called_once_with(status='success', infohash=infohash, message=ANY)

@@ -186,8 +186,11 @@ class TorrentClient:
                 handle = await asyncio.wait_for(meta_future, timeout=self.metadata_timeout)
             except asyncio.TimeoutError:
                 self.log.error("为 %s 获取元数据超时。", infohash)
-                self.pending_metadata.pop(infohash, None)
+                # The pop is now handled in the finally block
                 raise MetadataTimeoutError(f"获取元数据超时", infohash=infohash)
+            finally:
+                # 无论成功、超时还是其他异常，都确保清理字典
+                self.pending_metadata.pop(infohash, None)
 
             ti = await self._execute_sync(handle.get_torrent_info)
             if ti:

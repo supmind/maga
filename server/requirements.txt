@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+pydantic-settings
+python-dotenv
+python-multipart
+# For async database access
+databases[sqlite]
+# For migrations
+alembic

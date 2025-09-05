@@ -8,8 +8,8 @@
 import pytest
 import asyncio
 
-from screenshot.client import TorrentClient
-from screenshot.errors import MetadataTimeoutError
+from worker.screenshot.client import TorrentClient
+from worker.screenshot.errors import MetadataTimeoutError
 from config import Settings
 
 # 使用一个已知的、活跃度较高的 infohash 进行测试

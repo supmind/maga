@@ -9,9 +9,9 @@ from unittest.mock import patch, AsyncMock, MagicMock, PropertyMock, ANY
 import pytest
 from aiohttp import ClientSession
 
-import worker
+from worker import worker
 from config import Settings
-from screenshot.service import ScreenshotService
+from worker.screenshot.service import ScreenshotService
 
 
 @pytest.fixture
@@ -100,24 +100,25 @@ async def test_scheduler_api_client_send_heartbeat():
     """
     # --- 安排 ---
     mock_session = AsyncMock(spec=ClientSession)
-    client = worker.SchedulerAPIClient(mock_session, "http://fake-scheduler")
+    # The client now requires the api_key
+    client = worker.SchedulerAPIClient(mock_session, "http://fake-scheduler", "test-key")
 
     mock_service = MagicMock(spec=ScreenshotService)
     type(mock_service).active_tasks = PropertyMock(return_value={"t1", "t2", "t3"})
     mock_service.get_queue_size.return_value = 1
 
     # --- 执行 ---
-    await client.send_heartbeat("worker-id", mock_service, 50)
+    await client.send_heartbeat("worker-id", mock_service)
 
     # --- 断言 ---
     expected_payload = {
         "worker_id": "worker-id",
         "status": "busy",
         "active_tasks_count": 2, # 3 (total) - 1 (queued) = 2 (processing)
-        "queue_size": 1,
-        "processed_tasks_count": 50
+        "queue_size": 1
     }
     mock_session.post.assert_awaited_once_with(
         "http://fake-scheduler/workers/heartbeat",
-        json=expected_payload
+        json=expected_payload,
+        headers={"X-API-Key": "test-key"}
     )

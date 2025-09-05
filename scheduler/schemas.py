@@ -18,11 +18,13 @@ class TaskCreate(TaskBase):
 class Task(TaskBase):
     id: int
     status: str = Field("pending", description="任务的当前状态 (e.g., pending, working, success, failure)。")
+    torrent_name: Optional[str] = None
+    video_filename: Optional[str] = None
+    video_duration_seconds: Optional[int] = None
     created_at: datetime.datetime
     assigned_worker_id: Optional[str] = None
     result_message: Optional[str] = None
     successful_screenshots: Optional[List[str]] = Field([], description="成功生成的截图文件名列表。")
-    resume_data: Optional[Dict[str, Any]] = Field(None, description="用于任务恢复的上下文数据。")
 
     class Config:
         orm_mode = True
@@ -42,6 +44,16 @@ class TaskStatusUpdate(BaseModel):
     resume_data: Optional[Dict[str, Any]] = None
 
 
+class TaskDetailsUpdate(BaseModel):
+    torrent_name: Optional[str] = None
+    video_filename: Optional[str] = None
+    video_duration_seconds: Optional[int] = None
+
+
+class ScreenshotRecord(BaseModel):
+    filename: str = Field(..., description="要记录的截图文件名。")
+
+
 # --- 工作节点 (Worker) 相关的模型 ---
 
 class WorkerBase(BaseModel):
@@ -54,7 +66,6 @@ class WorkerHeartbeat(WorkerBase):
     status: str
     active_tasks_count: int
     queue_size: int
-    processed_tasks_count: int
 
 class Worker(WorkerBase):
     id: int
@@ -63,7 +74,6 @@ class Worker(WorkerBase):
     last_seen_at: datetime.datetime
     active_tasks_count: int
     queue_size: int
-    processed_tasks_count: int = 0
 
     class Config:
         orm_mode = True

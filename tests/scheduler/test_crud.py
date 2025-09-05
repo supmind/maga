@@ -65,21 +65,20 @@ def test_update_non_existent_worker_status(db_session):
     """测试更新一个不存在的工作节点状态时应返回 None。"""
     updated_worker = crud.update_worker_status(
         db_session, worker_id="non_existent_worker", status="busy",
-        active_tasks_count=0, queue_size=0, processed_tasks_count=0
+        active_tasks_count=0, queue_size=0
     )
     assert updated_worker is None
 
 def test_update_worker_status(db_session):
     """测试更新工作节点状态的功能。"""
-    crud.create_worker(db_session, worker=schemas.WorkerCreate(worker_id="worker-002"))
+    crud.create_worker(db_session, worker=schemas.WorkerCreate(worker_id="worker-002", status="idle"))
     updated_worker = crud.update_worker_status(
         db_session, worker_id="worker-002", status="busy",
-        active_tasks_count=1, queue_size=1, processed_tasks_count=10
+        active_tasks_count=1, queue_size=1
     )
     assert updated_worker.status == "busy"
     assert updated_worker.active_tasks_count == 1
     assert updated_worker.queue_size == 1
-    assert updated_worker.processed_tasks_count == 10
 
 def test_get_and_assign_next_task(db_session):
     """测试原子性地获取并分配下一个待处理任务的功能。"""
@@ -96,18 +95,16 @@ def test_update_non_existent_task_status(db_session):
     assert updated_task is None
 
 def test_update_task_status(db_session):
-    """测试更新任务最终状态的功能，包括 resume_data 和 message。"""
+    """测试更新任务最终状态的功能。"""
     crud.create_task(db_session, task=schemas.TaskCreate(infohash="task_to_update"))
     crud.get_and_assign_next_task(db_session, worker_id="worker-005")
 
-    resume_data = {"key": "value"}
     message = "Completed with data"
-    updated_task = crud.update_task_status(db_session, infohash="task_to_update", status="success", message=message, resume_data=resume_data)
+    updated_task = crud.update_task_status(db_session, infohash="task_to_update", status="success", message=message)
 
     assert updated_task.status == "success"
     assert updated_task.assigned_worker_id is None
     assert updated_task.result_message == message
-    assert updated_task.resume_data == resume_data
 
 def test_record_screenshot_for_non_existent_task(db_session):
     """测试为不存在的任务记录截图时应返回 None。"""
@@ -133,3 +130,60 @@ def test_record_screenshot_multiple_times(db_session):
     assert isinstance(final_screenshots, list)
     assert len(final_screenshots) == 3
     assert set(final_screenshots) == {"file1.jpg", "file2.jpg", "file3.jpg"}
+
+
+def test_upsert_worker_creation(db_session):
+    """测试当工作节点不存在时，upsert_worker 是否能正确创建新的工作节点。"""
+    worker_id = "new_worker_for_upsert"
+    worker = crud.upsert_worker(db_session, worker_id=worker_id, status="idle")
+    assert worker is not None
+    assert worker.worker_id == worker_id
+    assert worker.status == "idle"
+    retrieved_worker = crud.get_worker_by_id(db_session, worker_id)
+    assert retrieved_worker is not None
+    assert retrieved_worker.id == worker.id
+
+
+def test_upsert_worker_update(db_session):
+    """测试当工作节点已存在时，upsert_worker 是否能正确更新其信息。"""
+    worker_id = "existing_worker_for_upsert"
+    # 首先创建一个工作节点
+    crud.create_worker(db_session, schemas.WorkerCreate(worker_id=worker_id, status="idle"))
+
+    # 然后使用 upsert 更新它
+    updated_worker = crud.upsert_worker(db_session, worker_id=worker_id, status="busy")
+
+    assert updated_worker is not None
+    assert updated_worker.status == "busy"
+    assert updated_worker.last_seen_at is not None
+
+    retrieved_worker = crud.get_worker_by_id(db_session, worker_id)
+    assert retrieved_worker.status == "busy"
+
+
+def test_reset_stuck_tasks(db_session):
+    """测试 reset_stuck_tasks 是否能正确地将卡死的任务状态重置为 'pending'。"""
+    from datetime import datetime, timedelta
+
+    # 1. 创建一个任务并分配给一个 worker，使其状态变为 'working'
+    infohash = "stuck_task_hash"
+    worker_id = "worker_for_stuck_task"
+    crud.create_task(db_session, schemas.TaskCreate(infohash=infohash))
+    task = crud.get_and_assign_next_task(db_session, worker_id=worker_id)
+    assert task.status == 'working'
+
+    # 2. 手动将任务的 updated_at 时间戳更新为过去的时间，模拟卡死状态
+    stuck_time = datetime.utcnow() - timedelta(hours=1)
+    db_session.query(models.Task).filter_by(infohash=infohash).update({"updated_at": stuck_time}, synchronize_session=False)
+    db_session.commit()
+
+    # 3. 执行重置操作
+    timeout_seconds = 30 * 60  # 30 分钟
+    reset_count = crud.reset_stuck_tasks(db_session, timeout_seconds)
+
+    # 4. 验证结果
+    assert reset_count == 1
+
+    updated_task = crud.get_task_by_infohash(db_session, infohash)
+    assert updated_task.status == 'pending'
+    assert updated_task.assigned_worker_id is None

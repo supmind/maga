@@ -6,8 +6,8 @@ import pytest
 import struct
 from io import BytesIO
 
-from screenshot.extractor import KeyframeExtractor
-from screenshot.errors import MP4ParsingError
+from worker.screenshot.extractor import KeyframeExtractor
+from worker.screenshot.errors import MP4ParsingError
 
 # --- 测试资源 ---
 TEST_VIDEO_PATH = "tests/assets/test_video.mp4"

@@ -8,11 +8,11 @@ import struct
 import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
 
-from screenshot.service import ScreenshotService, StatusCallback
+from worker.screenshot.service import ScreenshotService, StatusCallback
 from config import Settings
-from screenshot.errors import MP4ParsingError, NoVideoFileError, FrameDownloadTimeoutError, MoovNotFoundError
-from screenshot.extractor import Keyframe, SampleInfo, KeyframeExtractor
-from screenshot.client import TorrentClient
+from worker.screenshot.errors import MP4ParsingError, NoVideoFileError, FrameDownloadTimeoutError, MoovNotFoundError
+from worker.screenshot.extractor import Keyframe, SampleInfo, KeyframeExtractor
+from worker.screenshot.client import TorrentClient
 
 
 # --- 新增的测试 ---
@@ -115,7 +115,7 @@ def mock_callbacks():
 def service(settings, mock_callbacks):
     """提供一个依赖已被 mock 的 ScreenshotService 实例。"""
     loop = asyncio.get_event_loop()
-    with patch('screenshot.service.TorrentClient'), patch('screenshot.service.ScreenshotGenerator'):
+    with patch('worker.screenshot.service.TorrentClient'), patch('worker.screenshot.service.ScreenshotGenerator'):
         service_instance = ScreenshotService(
             settings=settings, loop=loop, status_callback=mock_callbacks["status_callback"]
         )
@@ -124,13 +124,45 @@ def service(settings, mock_callbacks):
 # --- Test Cases ---
 
 def test_select_keyframes_logic(service):
-    """测试 _select_keyframes 方法的逻辑。"""
-    keyframes = [Keyframe(i, i, i, 1) for i in range(10)]
-    samples = [MagicMock(pts=180 * 90000)]
-    selected = service._select_keyframes(keyframes, 90000, samples)
+    """
+    测试新的 _select_keyframes 逻辑，确保它是根据时间戳均匀选择，
+    而不是根据关键帧在列表中的索引。
+    """
+    # 1. 创建一组时间戳分布不均的关键帧
+    # Keyframe(index, sample_index, pts, timescale)
+    all_keyframes = [
+        Keyframe(0, 0, 0, 90000),      # 0s
+        Keyframe(1, 1, 10 * 90000, 90000), # 10s
+        Keyframe(2, 2, 20 * 90000, 90000), # 20s
+        Keyframe(3, 3, 88 * 90000, 90000), # 88s
+        Keyframe(4, 4, 95 * 90000, 90000), # 95s
+        Keyframe(5, 5, 170 * 90000, 90000) # 170s
+    ]
+
+    # 视频总时长为 180s
+    duration_pts = 180 * 90000
+
+    # 根据 settings (min=2, max=5, interval=60), 180s 的视频应该生成 180/60 = 3 张截图
+    # 目标时间点应该是: 0s, 60s, 120s
+
+    # 2. 调用被测方法
+    selected = service._select_keyframes(all_keyframes, 90000, duration_pts, None)
+
+    # 3. 断言
     assert len(selected) == 3
 
-@patch('screenshot.service.KeyframeExtractor')
+    selected_pts = [kf.pts for kf in selected]
+
+    # 验证逻辑：
+    # 目标时间点 (PTS): [0, 5400000, 10800000] (0s, 60s, 120s)
+    #
+    # target = 0 -> closest is 0
+    # target = 5400000 (60s) -> closest is 88s (PTS 7920000), diff=28s.
+    # target = 10800000 (120s) -> closest is 95s (PTS 8550000), diff=25s.
+    expected_pts = [0, 88 * 90000, 95 * 90000]
+    assert sorted(selected_pts) == sorted(expected_pts)
+
+@patch('worker.screenshot.service.KeyframeExtractor')
 def test_load_state_from_resume_data(MockKeyframeExtractor, service):
     """测试从 resume_data 恢复任务状态的逻辑。"""
     mock_extractor_instance = MockKeyframeExtractor.return_value

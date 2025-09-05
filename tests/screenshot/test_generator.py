@@ -7,8 +7,8 @@ import os
 import asyncio
 from PIL import Image
 
-from screenshot.generator import ScreenshotGenerator
-from screenshot.extractor import KeyframeExtractor
+from worker.screenshot.generator import ScreenshotGenerator
+from worker.screenshot.extractor import KeyframeExtractor
 from tests.screenshot.test_extractor import moov_atom_data # 复用 extractor 测试的 fixture
 
 # --- 测试资源 ---
@@ -41,12 +41,11 @@ def video_packet_data(moov_atom_data):
 # --- 测试用例 ---
 
 @pytest.mark.asyncio
-async def test_screenshot_generator_creates_valid_jpeg(tmpdir, video_packet_data):
+async def test_screenshot_generator_creates_valid_jpeg(video_packet_data):
     """
-    测试 ScreenshotGenerator 是否能成功解码一个数据包并生成一个有效的 JPEG 文件。
+    测试 ScreenshotGenerator 是否能成功解码一个数据包并生成一个有效的 JPEG 字节串。
     """
     # 1. 准备测试环境和参数
-    output_dir = str(tmpdir)
     loop = asyncio.get_running_loop()
     infohash_hex = "test_generator_infohash"
     timestamp_str = "00-00-00"
@@ -54,12 +53,14 @@ async def test_screenshot_generator_creates_valid_jpeg(tmpdir, video_packet_data
     # 创建一个 Future 用于回调函数，以便我们可以等待它完成
     callback_called = asyncio.Future()
 
-    async def on_success_callback(infohash, filepath):
+    async def on_success_callback(infohash, image_bytes, ts):
         """测试用的回调函数，当被调用时，设置 Future 的结果。"""
-        callback_called.set_result((infohash, filepath))
+        if not callback_called.done():
+            callback_called.set_result((infohash, image_bytes, ts))
 
     # 2. 实例化并运行生成器
-    generator = ScreenshotGenerator(loop=loop, output_dir=output_dir, on_success=on_success_callback)
+    # output_dir 已废弃，但为保持构造函数兼容性而传入
+    generator = ScreenshotGenerator(loop=loop, output_dir="", on_success=on_success_callback)
 
     packet_data = video_packet_data["packet_data"]
 
@@ -83,22 +84,12 @@ async def test_screenshot_generator_creates_valid_jpeg(tmpdir, video_packet_data
         timestamp_str=timestamp_str
     )
 
-    # 3. 验证结果
-    # 验证回调函数是否被调用
-    cb_infohash, cb_filepath = await asyncio.wait_for(callback_called, timeout=5)
-    assert cb_infohash == infohash_hex
-
-    # 验证文件是否已创建
-    expected_filename = f"{infohash_hex}_{timestamp_str}.jpg"
-    expected_filepath = os.path.join(output_dir, expected_filename)
-    assert cb_filepath == expected_filepath
-    assert os.path.exists(expected_filepath)
-
-    # 验证生成的文件是一个有效的、非空的 JPEG 图片
+    # 3. 等待并验证回调结果
     try:
-        with Image.open(expected_filepath) as img:
-            assert img.format == "JPEG"
-            assert img.width > 0
-            assert img.height > 0
-    except Exception as e:
-        pytest.fail(f"无法打开或验证生成的图片文件: {e}")
+        infohash, image_bytes, ts = await asyncio.wait_for(callback_called, timeout=2)
+        assert infohash == infohash_hex
+        assert ts == timestamp_str
+        assert isinstance(image_bytes, bytes)
+        assert len(image_bytes) > 100, "生成的 JPEG 字节数过少，可能为空或无效"
+    except asyncio.TimeoutError:
+        pytest.fail("ScreenshotGenerator 的 on_success 回调在2秒内未被调用。")

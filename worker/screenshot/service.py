@@ -39,7 +39,7 @@ class ScreenshotService:
     7.  管理任务状态，支持从失败中恢复 (断点续传)。
     8.  通过回调函数向上层报告任务的最终状态和生成的截图。
     """
-    def __init__(self, settings: Settings, loop=None, client=None, status_callback: Optional[StatusCallback] = None, screenshot_callback: Optional[Callable] = None):
+    def __init__(self, settings: Settings, loop=None, client=None, status_callback: Optional[StatusCallback] = None, screenshot_callback: Optional[Callable] = None, details_callback: Optional[Callable] = None):
         self.loop = loop or asyncio.get_event_loop()
         self.settings = settings
         self.log = logging.getLogger("ScreenshotService")
@@ -57,6 +57,7 @@ class ScreenshotService:
             on_success=screenshot_callback
         )
         self.status_callback = status_callback
+        self.details_callback = details_callback
         self.active_tasks = set()
         self._submit_lock = asyncio.Lock()
 
@@ -262,28 +263,70 @@ class ScreenshotService:
 
         raise MoovNotFoundError("无法在文件的头部或尾部定位 'moov' atom。", infohash_hex)
 
-    def _find_video_file(self, ti: "lt.torrent_info") -> Tuple[int, int, int]:
+    def _find_video_file(self, ti: "lt.torrent_info") -> Tuple[int, int, int, Optional[str]]:
         """在 torrent 中查找最大的视频文件（目前仅支持.mp4）并返回其信息。"""
-        video_file_index, video_file_size, video_file_offset = -1, -1, -1
+        video_file_index, video_file_size, video_file_offset, video_filename = -1, -1, -1, None
         fs = ti.files()
         for i in range(fs.num_files()):
-            if fs.file_path(i).lower().endswith('.mp4') and fs.file_size(i) > video_file_size:
-                video_file_size, video_file_index, video_file_offset = fs.file_size(i), i, fs.file_offset(i)
-        return video_file_index, video_file_size, video_file_offset
+            file_path = fs.file_path(i)
+            if file_path.lower().endswith('.mp4') and fs.file_size(i) > video_file_size:
+                video_file_size = fs.file_size(i)
+                video_file_index = i
+                video_file_offset = fs.file_offset(i)
+                video_filename = file_path
+        return video_file_index, video_file_size, video_file_offset, video_filename
 
-    def _select_keyframes(self, all_keyframes: list, timescale: int, samples: list) -> list:
-        """根据配置的规则，从所有关键帧中均匀地选择一个有代表性的子集用于生成截图。"""
-        if not all_keyframes: return []
-        duration_sec = samples[-1].pts / timescale if timescale > 0 and samples else 0
+    def _select_keyframes(self, all_keyframes: list[Keyframe], timescale: int, duration_pts: int, samples: list = None) -> list[Keyframe]:
+        """
+        根据关键帧的显示时间戳 (PTS) 从所有关键帧中均匀地选择一个代表性子集。
+        这种方法确保了截图在视频的时间线上是均匀分布的，而不是基于关键帧在列表中的索引。
 
+        :param all_keyframes: 包含所有关键帧的列表。
+        :param timescale: 视频的 timescale，用于将 PTS 转换为秒。
+        :param duration_pts: 视频的总时长 (以 PTS 为单位)。
+        :param samples: 视频的样本列表，用于在 duration_pts 不可用时作为备用。
+        :return: 一个代表性的关键帧子集。
+        """
+        if not all_keyframes:
+            return []
+
+        # 如果从 'mdhd' box 中未能成功解析出时长，则回退到基于最后一个样本时间戳的估算
+        if duration_pts == 0 and samples:
+            self.log.warning("duration_pts 为 0，将使用最后一个样本的 PTS 作为估算时长。")
+            duration_pts = samples[-1].pts
+
+        duration_sec = duration_pts / timescale if timescale > 0 else 0
+
+        # 根据视频时长和配置计算目标截图数量
         num_screenshots = self.settings.default_screenshots
         if duration_sec > 0:
-            num_screenshots = max(self.settings.min_screenshots, min(int(duration_sec / self.settings.target_interval_sec), self.settings.max_screenshots))
+            num_screenshots = max(
+                self.settings.min_screenshots,
+                min(int(duration_sec / self.settings.target_interval_sec), self.settings.max_screenshots)
+            )
 
         if len(all_keyframes) <= num_screenshots:
             return all_keyframes
-        indices = [int(i * len(all_keyframes) / num_screenshots) for i in range(num_screenshots)]
-        return [all_keyframes[i] for i in sorted(list(set(indices)))]
+
+        # 计算目标时间点
+        target_timestamps_pts = [
+            int(i * duration_pts / num_screenshots) for i in range(num_screenshots)
+        ]
+
+        selected_keyframes = []
+        # 对于每个目标时间点，找到 PTS 最接近它的关键帧
+        for target_pts in target_timestamps_pts:
+            # 使用 min 函数和一个 lambda 来找到差值最小的关键帧
+            closest_keyframe = min(
+                all_keyframes,
+                key=lambda kf: abs(kf.pts - target_pts)
+            )
+            if closest_keyframe not in selected_keyframes:
+                selected_keyframes.append(closest_keyframe)
+
+        # 按 PTS 排序，以确保截图顺序与视频播放顺序一致
+        selected_keyframes.sort(key=lambda kf: kf.pts)
+        return selected_keyframes
 
     def _serialize_task_state(self, state: dict) -> dict:
         """将一个实时的、包含复杂对象的任务状态，转换为一个 JSON 可序列化的字典，用于任务恢复。"""
@@ -364,7 +407,7 @@ class ScreenshotService:
             else: packet_data = packet_data_bytes
 
             ts_sec = keyframe.pts / keyframe.timescale if keyframe.timescale > 0 else keyframe.index
-            m, s = divmod(ts_sec, 60); h, m = divmod(m, 60); timestamp_str = f"{int(h):02d}-{int(m):02d}-{int(s):02d}"
+            timestamp_str = str(int(ts_sec))
             return self.loop.create_task(self.generator.generate(extractor.codec_name, extractor.extradata, packet_data, infohash_hex, timestamp_str))
 
         torrent_is_complete = False
@@ -407,15 +450,27 @@ class ScreenshotService:
         if not resume_data:
             ti = handle.get_torrent_info()
             piece_length = ti.piece_length()
-            video_file_index, video_file_size, video_file_offset = self._find_video_file(ti)
+            video_file_index, video_file_size, video_file_offset, video_filename = self._find_video_file(ti)
             if video_file_index == -1: raise NoVideoFileError("在 torrent 中没有找到 .mp4 文件。", infohash_hex)
             moov_data = await self._get_moov_atom_data(handle, video_file_offset, video_file_size, piece_length, infohash_hex)
             try:
                 extractor = KeyframeExtractor(moov_data)
                 if not extractor.keyframes: raise MoovParsingError("无法从 moov atom 中提取任何关键帧。", infohash_hex)
             except (MP4ParsingError, Exception) as e: raise MoovParsingError(f"解析 moov 数据时失败: {e}", infohash_hex) from e
+
+            if self.details_callback:
+                duration_sec = extractor.duration_pts / extractor.timescale if extractor.timescale > 0 else 0
+                details = {
+                    "torrent_name": ti.name(),
+                    "video_filename": video_filename,
+                    "video_duration_seconds": int(duration_sec)
+                }
+                await self.details_callback(infohash_hex, details)
+
             all_keyframes = extractor.keyframes
-            selected_keyframes = self._select_keyframes(all_keyframes, extractor.timescale, extractor.samples)
+            selected_keyframes = self._select_keyframes(
+                all_keyframes, extractor.timescale, extractor.duration_pts, extractor.samples
+            )
             task_state = {
                 "infohash": infohash_hex, "piece_length": piece_length, "video_file_offset": video_file_offset,
                 "video_file_size": video_file_size, "extractor": extractor, "all_keyframes": all_keyframes,

@@ -64,6 +64,7 @@ class KeyframeExtractor:
         self.mode: str = "unknown"              # 码流模式 (如 'avc1', 'avc3')
         self.nal_length_size: int = 4           # NAL 单元长度字段的字节数
         self.timescale: int = 1000              # 媒体时间尺度
+        self.duration_pts: int = 0              # 视频轨道总时长 (以 timescale 为单位)
 
         if moov_data:
             try:
@@ -153,13 +154,21 @@ class KeyframeExtractor:
                         trak_payload = t_payload_iter; break
         if not trak_payload: raise ValueError("在 'moov' Box 中未找到有效的视频轨道。")
 
-        # 步骤 2: 从 'mdhd' (Media Header) box 获取 timescale
-        # Timescale 是定义媒体時間单位的关键参数。
+        # 步骤 2: 从 'mdhd' (Media Header) box 获取 timescale 和总时长
+        # Timescale 是定义媒体时间单位的关键参数。
         mdhd_payload = self._find_box_payload(trak_payload, ['mdia', 'mdhd'])
         if mdhd_payload:
             version = struct.unpack('>B', mdhd_payload.read(1))[0]
-            mdhd_payload.seek(12 if version == 0 else 20)
-            self.timescale = struct.unpack('>I', mdhd_payload.read(4))[0]
+            if version == 0:
+                mdhd_payload.seek(12)
+                self.timescale = struct.unpack('>I', mdhd_payload.read(4))[0]
+                self.duration_pts = struct.unpack('>I', mdhd_payload.read(4))[0]
+            else:  # version 1
+                mdhd_payload.seek(20)
+                self.timescale = struct.unpack('>I', mdhd_payload.read(4))[0]
+                self.duration_pts = struct.unpack('>Q', mdhd_payload.read(8))[0]
+        else:
+            log.warning("在视频轨道中未找到 'mdhd' box，无法确定 timescale 和 duration。")
         trak_payload.seek(0)
 
         # 步骤 3: 找到 'stbl' (Sample Table) box，它是所有采样信息的核心容器。

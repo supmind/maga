@@ -1,4 +1,6 @@
 import random
+import os
+import csv
 import joblib
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
@@ -40,12 +42,35 @@ def generate_dataset(num_samples=2000):
     labels = [1] * (num_samples // 2) + [0] * (num_samples // 2)
     return filenames, labels
 
+def load_data_from_csv(filepath):
+    """从CSV文件加载数据"""
+    filenames, labels = [], []
+    with open(filepath, 'r', newline='', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        next(reader)  # 跳过表头
+        for row in reader:
+            if len(row) == 2:
+                filenames.append(row[0])
+                labels.append(int(row[1]))
+    return filenames, labels
+
 def train_and_save_model(output_path='porn_classification_pipeline.joblib'):
     """
     构建、训练并保存整个分类流水线
     """
-    print("1. Generating simulated dataset...")
-    filenames, labels = generate_dataset()
+    log_file = 'classification_log.csv'
+    # 检查是否存在真实的日志数据，如果存在则使用它，否则使用模拟数据
+    if os.path.exists(log_file) and os.path.getsize(log_file) > 50: # 50 bytes as a threshold for non-empty
+        print("1. Found existing log file. Training model from `classification_log.csv`...")
+        filenames, labels = load_data_from_csv(log_file)
+        if not filenames:
+             print("   Log file is empty. Falling back to simulated data.")
+             print("1. Generating simulated dataset...")
+             filenames, labels = generate_dataset()
+    else:
+        print("1. No existing log file found. Training model from simulated data...")
+        filenames, labels = generate_dataset()
+
 
     # 构建特征处理流水线
     feature_union = FeatureUnion([
@@ -67,7 +92,10 @@ def train_and_save_model(output_path='porn_classification_pipeline.joblib'):
 
     # 训练流水线
     print("2. Training the full pipeline...")
-    X_train, X_test, y_train, y_test = train_test_split(filenames, labels, test_size=0.2, random_state=42)
+    # 使用分层抽样 (stratify=labels) 确保即使在小数据集上，测试集也能保持原始的类别比例
+    X_train, X_test, y_train, y_test = train_test_split(
+        filenames, labels, test_size=0.2, random_state=42, stratify=labels
+    )
     pipeline.fit(X_train, y_train)
 
     # 评估流水线

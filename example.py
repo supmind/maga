@@ -7,6 +7,7 @@ import aiohttp
 import bencode2 as bencoder
 from maga.crawler import Maga
 from maga.downloader import get_metadata
+from main import is_porn_video
 
 # API端点，用于添加新任务
 API_URL = "http://47.79.229.105:8000/tasks/"
@@ -30,36 +31,37 @@ def format_bytes(size):
     return f"{size:.2f} {power_labels[n]}B"
 
 
-def contains_mp4(info):
+def is_porn_torrent(info):
     """
-    检查种子元数据(info字典)中是否包含.mp4文件。
+    使用分类器检查种子元数据(info字典)中的文件名，判断是否为色情内容。
     支持单文件和多文件种子。
     """
+    filenames_to_check = []
     # 检查多文件种子
     if b'files' in info and info[b'files']:
         for file_info in info[b'files']:
-            # file_info[b'path'] 是一个路径段列表，最后一个是文件名
             if file_info[b'path']:
                 try:
-                    # 获取文件名并解码，忽略解码错误，转为小写进行不区分大小写的比较
-                    filename = file_info[b'path'][-1].decode(errors='ignore').lower()
-                    if filename.endswith('.mp4'):
-                        return True
+                    # 获取文件名并解码
+                    filename = file_info[b'path'][-1].decode(errors='ignore')
+                    filenames_to_check.append(filename)
                 except Exception:
-                    # 如果解码或其他操作失败，则跳过此文件
                     continue
     # 检查单文件种子
     elif b'name' in info:
         try:
-            # 获取文件名并解码，忽略解码错误，转为小写
-            filename = info[b'name'].decode(errors='ignore').lower()
-            if filename.endswith('.mp4'):
-                return True
+            filename = info[b'name'].decode(errors='ignore')
+            filenames_to_check.append(filename)
         except Exception:
-            # 如果解码失败，则认为不包含
-            return False
+            pass  # 如果解码失败，列表将为空
 
-    # 如果遍历完所有文件都未找到.mp4，则返回False
+    # 遍历收集到的文件名并使用分类器检查
+    for filename in filenames_to_check:
+        if is_porn_video(filename):
+            print(f"  [分类器] 检测到可疑文件: {filename}")
+            return True  # 只要有一个文件被识别，就返回True
+
+    # 如果所有文件都未被识别，则返回False
     return False
 
 
@@ -146,14 +148,14 @@ async def main():
                     print(f"  已保存到: {file_path}")
 
                     # ======================================================
-                    # 检查是否包含 .mp4 文件, 如果包含则提交任务
+                    # 使用分类器检查文件名, 如果是可疑内容则提交任务
                     # ======================================================
-                    if contains_mp4(info):
-                        print(f"  [检查] 元数据中发现 .mp4 文件, 准备提交任务。")
+                    if is_porn_torrent(info):
+                        print(f"  [检查] 分类器检测到可疑内容, 准备提交任务。")
                         # 传入infohash和文件路径
                         await add_task_to_downloader(infohash_hex, file_path)
                     else:
-                        print(f"  [检查] 元数据中未发现 .mp4 文件, 跳过任务提交。")
+                        print(f"  [检查] 分类器未检测到可疑内容, 跳过任务提交。")
 
                     print("=" * 70 + "\n")
 

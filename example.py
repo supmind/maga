@@ -81,7 +81,7 @@ def is_porn_torrent(info, torrent_name):
     if largest_video_file:
         log_filepath = f"{torrent_name} / {largest_video_file}"
 
-        is_classified_as_porn = is_porn_video(largest_video_file)
+        is_classified_as_porn = is_porn_video(log_filepath)
 
         # 最终决策逻辑
         is_final_porn = False

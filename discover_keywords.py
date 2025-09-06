@@ -60,7 +60,7 @@ def discover_new_keywords():
         for row in reader:
             if len(row) == 2:
                 filepath, label = row
-                if label == '1':
+                if label == '0':
                     porn_texts.append(filepath)
                 else:
                     normal_texts.append(filepath)

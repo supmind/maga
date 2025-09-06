@@ -32,9 +32,22 @@ def generate_filename(is_porn):
         code_part = f"{random.choice(['ABC', 'DEF', 'GHI'])}-{random.randint(100, 999)}"
         return f"[{keyword_part}] {code_part} some other text.mp4"
     else:
-        # 正常样本保持空格分隔
-        keyword_part = ' '.join(random.sample(NORMAL_KEYWORDS, random.randint(1, 3)))
-        return f"{keyword_part} (2023) Official Trailer.mkv"
+        # 模拟真实的电影/电视剧文件名
+        name_part = " ".join(random.sample(['The', 'My', 'A', 'Secret', 'Last', 'Final', 'Dark', 'Project'], 2)).title().replace(' ', '.')
+        year_part = f"({random.randint(2000, 2024)})"
+        quality_part = random.choice(['720p', '1080p', '2160p'])
+        source_part = random.choice(['BluRay', 'WEBRip', 'HDTV'])
+        codec_part = random.choice(['x264', 'x265'])
+        group_part = random.choice(['YIFY', 'RARBG', 'SPARKS', 'GECKOS'])
+        ext = random.choice(['.mkv', '.mp4'])
+
+        # 随机组合成不同的格式
+        template = random.choice([
+            f"{name_part}.{year_part}.{quality_part}.{source_part}.{codec_part}-{group_part}{ext}",
+            f"{name_part}.S{random.randint(1,12):02d}E{random.randint(1,24):02d}.{quality_part}.{source_part}.{codec_part}{ext}",
+            f"{name_part} {year_part} {quality_part} {source_part} {codec_part} {group_part}{ext}"
+        ])
+        return template
 
 def generate_dataset(num_samples=2000):
     filenames = [generate_filename(True) for _ in range(num_samples // 2)]

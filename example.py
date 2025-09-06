@@ -9,6 +9,7 @@ import bencode2 as bencoder
 from maga.crawler import Maga
 from maga.downloader import get_metadata
 from main import is_porn_video
+from porn_classifier_utils import is_target_language
 
 # API端点，用于添加新任务
 API_URL = "http://47.79.229.105:8000/tasks/"
@@ -76,6 +77,11 @@ def is_porn_torrent(info, torrent_name):
 
     # 2. 如果找到了视频文件，则对其进行分类和日志记录
     if largest_video_file:
+        # 首先，进行语言检测
+        if not is_target_language(largest_video_file):
+            print(f"  [语言检测] 跳过非目标语言文件: {largest_video_file}")
+            return False
+
         log_filepath = f"{torrent_name} / {largest_video_file}"
 
         # 进行分类

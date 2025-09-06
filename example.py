@@ -85,7 +85,7 @@ def is_porn_torrent(info, torrent_name):
         log_filepath = f"{torrent_name} / {largest_video_file}"
 
         # 进行分类
-        is_porn = is_porn_video(largest_video_file)
+        is_porn = is_porn_video(log_filepath)
         label = 1 if is_porn else 0
 
         # 写入CSV

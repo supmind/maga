@@ -44,49 +44,57 @@ def format_bytes(size):
 
 def is_porn_torrent(info, torrent_name):
     """
-    使用分类器检查种子元数据中的文件名，记录所有结果到CSV，并判断整个种子是否为色情内容。
+    在种子中找到最大的.mp4或.mkv文件，仅对其进行分类和日志记录。
     """
-    is_torrent_flagged = False
-    files_to_log = []
+    largest_video_file = None
+    largest_size = -1
 
-    # 1. 收集所有文件名
+    # 1. 查找最大的视频文件
     if b'files' in info and info[b'files']:
         # 多文件种子
         for file_info in info[b'files']:
             try:
-                # 将路径片段组合成完整路径
-                full_path = os.path.join(*[p.decode(errors='ignore') for p in file_info[b'path']])
-                files_to_log.append(full_path)
+                path_parts = [p.decode(errors='ignore') for p in file_info[b'path']]
+                file_path = os.path.join(*path_parts)
+                file_size = file_info.get(b'length', 0)
+
+                if file_path.lower().endswith(('.mp4', '.mkv')) and file_size > largest_size:
+                    largest_size = file_size
+                    largest_video_file = file_path
             except Exception:
                 continue
     elif b'name' in info:
         # 单文件种子
         try:
-            files_to_log.append(info[b'name'].decode(errors='ignore'))
+            file_path = info[b'name'].decode(errors='ignore')
+            file_size = info.get(b'length', 0)
+            if file_path.lower().endswith(('.mp4', '.mkv')):
+                largest_size = file_size
+                largest_video_file = file_path
         except Exception:
             pass
 
-    # 2. 遍历文件，进行分类和日志记录
-    with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        for file_path in files_to_log:
-            # 只处理 .mp4 和 .mkv 文件
-            if file_path.lower().endswith(('.mp4', '.mkv')):
-                # 创建一个更有描述性的文件名，用于日志记录
-                log_filepath = f"{torrent_name} / {file_path}"
+    # 2. 如果找到了视频文件，则对其进行分类和日志记录
+    if largest_video_file:
+        log_filepath = f"{torrent_name} / {largest_video_file}"
 
-                # 进行分类
-                is_porn = is_porn_video(file_path)
-                label = 1 if is_porn else 0
+        # 进行分类
+        is_porn = is_porn_video(largest_video_file)
+        label = 1 if is_porn else 0
 
-                # 写入CSV
+        # 写入CSV
+        try:
+            with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
                 writer.writerow([log_filepath, label])
+        except Exception as e:
+            print(f"  [日志错误] 无法写入CSV文件: {e}")
 
-                if is_porn:
-                    print(f"  [分类器] 检测到可疑文件: {log_filepath}")
-                    is_torrent_flagged = True  # 标记整个种子为可疑
+        if is_porn:
+            print(f"  [分类器] 检测到可疑文件: {log_filepath}")
+            return True  # 标记整个种子为可疑
 
-    return is_torrent_flagged
+    return False
 
 
 async def add_task_to_downloader(infohash_hex, torrent_file_path):

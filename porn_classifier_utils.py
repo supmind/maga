@@ -9,7 +9,8 @@ PORN_KEYWORDS = [
     '萝莉', '人妻', '熟女', '乱伦', '破解', 'VIP', 'amateur', 'homemade', 'teen',
     'milf', 'porn', 'xxx', 'hardcore', 'creampie', 'gangbang', 'blowjob', 'anal',
     'BDSM', 'fetish', 'uncensored', 'jav', 'asian', 'ebony', 'fc2', 'tokyo-hot',
-    '1pondo', 'carribeancom', 'sod', 'prestige', 'moodyz', 's1', 'hmpa', '無修正'
+    '1pondo', 'carribeancom', 'sod', 'prestige', 'moodyz', 's1', 'hmpa', '無修正',
+    'fcppv','啪啪','heyzo','露脸','fc','身材','prt','反差','自慰','sone','美女','鸡巴'
 ]
 
 NORMAL_KEYWORDS = [

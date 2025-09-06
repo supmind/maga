@@ -3,13 +3,14 @@ import signal
 import binascii
 import os
 import csv
+import re
 
 import aiohttp
 import bencode2 as bencoder
 from maga.crawler import Maga
 from maga.downloader import get_metadata
 from main import is_porn_video
-from porn_classifier_utils import is_target_language
+from porn_classifier_utils import RELEASE_CODE_PATTERN
 
 # API端点，用于添加新任务
 API_URL = "http://47.79.229.105:8000/tasks/"
@@ -43,62 +44,67 @@ def format_bytes(size):
     return f"{size:.2f} {power_labels[n]}B"
 
 
+def contains_cjk(text: str) -> bool:
+    """检查字符串是否包含任何中日韩字符"""
+    return bool(re.search(r'[\u4e00-\u9fff\u3040-\u30ff]', text))
+
+
 def is_porn_torrent(info, torrent_name):
     """
-    在种子中找到最大的.mp4或.mkv文件，仅对其进行分类和日志记录。
+    在种子中找到最大的视频文件，对其分类，并根据语言和番号规则进行最终判断和记录。
     """
     largest_video_file = None
     largest_size = -1
 
     # 1. 查找最大的视频文件
     if b'files' in info and info[b'files']:
-        # 多文件种子
         for file_info in info[b'files']:
             try:
                 path_parts = [p.decode(errors='ignore') for p in file_info[b'path']]
                 file_path = os.path.join(*path_parts)
                 file_size = file_info.get(b'length', 0)
-
                 if file_path.lower().endswith(('.mp4', '.mkv')) and file_size > largest_size:
                     largest_size = file_size
                     largest_video_file = file_path
             except Exception:
                 continue
     elif b'name' in info:
-        # 单文件种子
         try:
             file_path = info[b'name'].decode(errors='ignore')
-            file_size = info.get(b'length', 0)
             if file_path.lower().endswith(('.mp4', '.mkv')):
-                largest_size = file_size
+                largest_size = info.get(b'length', 0)
                 largest_video_file = file_path
         except Exception:
             pass
 
-    # 2. 如果找到了视频文件，则对其进行分类和日志记录
+    # 2. 如果找到了视频文件，则进行处理
     if largest_video_file:
-        # 首先，进行语言检测
-        if not is_target_language(largest_video_file):
-            print(f"  [语言检测] 跳过非目标语言文件: {largest_video_file}")
-            return False
-
         log_filepath = f"{torrent_name} / {largest_video_file}"
 
-        # 进行分类
-        is_porn = is_porn_video(log_filepath)
-        label = 1 if is_porn else 0
+        is_classified_as_porn = is_porn_video(largest_video_file)
+
+        # 最终决策逻辑
+        is_final_porn = False
+        if is_classified_as_porn:
+            # 如果包含CJK字符 或 包含番号，则认为是目标亚洲内容
+            if contains_cjk(log_filepath) or RELEASE_CODE_PATTERN.search(log_filepath):
+                is_final_porn = True
+                print(f"  [分类器] 检测到亚洲区域可疑文件: {log_filepath}")
+            else:
+                # 否则，视为欧美内容并忽略
+                print(f"  [分类器] 检测到非亚洲可疑文件，已按规则忽略: {log_filepath}")
+
+        final_label = 1 if is_final_porn else 0
 
         # 写入CSV
         try:
             with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow([log_filepath, label])
+                writer.writerow([log_filepath, final_label])
         except Exception as e:
             print(f"  [日志错误] 无法写入CSV文件: {e}")
 
-        if is_porn:
-            print(f"  [分类器] 检测到可疑文件: {log_filepath}")
-            return True  # 标记整个种子为可疑
+        return is_final_porn
 
     return False
 

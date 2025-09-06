@@ -9,8 +9,7 @@ PORN_KEYWORDS = [
     '萝莉', '人妻', '熟女', '乱伦', '破解', 'VIP', 'amateur', 'homemade', 'teen',
     'milf', 'porn', 'xxx', 'hardcore', 'creampie', 'gangbang', 'blowjob', 'anal',
     'BDSM', 'fetish', 'uncensored', 'jav', 'asian', 'ebony', 'fc2', 'tokyo-hot',
-    '1pondo', 'carribeancom', 'sod', 'prestige', 'moodyz', 's1', 'hmpa', '無修正',
-    'fcppv','啪啪','heyzo','露脸','fc','身材','prt','反差','自慰','sone','美女','鸡巴'
+    '1pondo', 'carribeancom', 'sod', 'prestige', 'moodyz', 's1', 'hmpa', '無修正'
 ]
 
 NORMAL_KEYWORDS = [
@@ -28,7 +27,9 @@ NORMAL_KEYWORDS = [
     'The', 'Of', 'And', 'A', 'With', 'Season', 'Episode'
 ]
 
-RELEASE_CODE_PATTERN = re.compile(r'\b[a-z]{2,5}-\d{3,5}\b', re.IGNORECASE)
+# 更全面的番号匹配规则
+# 涵盖: abc-123, abc_123, abc123, fc2-ppv-123456 等格式
+RELEASE_CODE_PATTERN = re.compile(r'\b(fc2-ppv-\d{5,}|[a-z]{2,5}[-_]?\d{3,5})\b', re.IGNORECASE)
 
 # 2. 自定义特征提取器
 class CustomFeatureTransformer(BaseEstimator, TransformerMixin):

@@ -13,7 +13,13 @@ CORRECTION_KEYWORDS = [
     '1pondo',
     'heyzo',
     'ssis',  # 使用小写以便进行不区分大小写的比较
-    'fc2ppv' # fc2-ppv 在预处理后可能会变成 fc2ppv
+    'fc2ppv',
+    'carib',
+    '国产',
+    '美女',
+    '淫妻',
+    '反差',
+    '露脸'# fc2-ppv 在预处理后可能会变成 fc2ppv
 ]
 # --- 脚本主逻辑 ---
 

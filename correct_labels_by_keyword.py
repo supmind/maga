@@ -19,7 +19,8 @@ CORRECTION_KEYWORDS = [
     '美女',
     '淫妻',
     '反差',
-    '露脸'# fc2-ppv 在预处理后可能会变成 fc2ppv
+    '露脸',
+    'caribbeancom'# fc2-ppv 在预处理后可能会变成 fc2ppv
 ]
 # --- 脚本主逻辑 ---
 

@@ -2,6 +2,7 @@ import asyncio
 import signal
 import binascii
 import os
+import csv
 
 import aiohttp
 import bencode2 as bencoder
@@ -11,11 +12,21 @@ from main import is_porn_video
 
 # API端点，用于添加新任务
 API_URL = "http://47.79.229.105:8000/tasks/"
+# 日志文件名
+LOG_FILE = 'classification_log.csv'
 
 # 使用一个集合（set）来记录已经处理过的infohash，防止重复下载
 PROCESSED_INFOHASHES = set()
 # 确保保存.torrent文件的目录存在
 os.makedirs("torrents", exist_ok=True)
+
+
+def setup_csv_log():
+    """如果日志文件不存在，则创建它并写入表头"""
+    if not os.path.exists(LOG_FILE):
+        with open(LOG_FILE, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['filepath', 'label'])
 
 
 def format_bytes(size):
@@ -31,38 +42,49 @@ def format_bytes(size):
     return f"{size:.2f} {power_labels[n]}B"
 
 
-def is_porn_torrent(info):
+def is_porn_torrent(info, torrent_name):
     """
-    使用分类器检查种子元数据(info字典)中的文件名，判断是否为色情内容。
-    支持单文件和多文件种子。
+    使用分类器检查种子元数据中的文件名，记录所有结果到CSV，并判断整个种子是否为色情内容。
     """
-    filenames_to_check = []
-    # 检查多文件种子
+    is_torrent_flagged = False
+    files_to_log = []
+
+    # 1. 收集所有文件名
     if b'files' in info and info[b'files']:
+        # 多文件种子
         for file_info in info[b'files']:
-            if file_info[b'path']:
-                try:
-                    # 获取文件名并解码
-                    filename = file_info[b'path'][-1].decode(errors='ignore')
-                    filenames_to_check.append(filename)
-                except Exception:
-                    continue
-    # 检查单文件种子
+            try:
+                # 将路径片段组合成完整路径
+                full_path = os.path.join(*[p.decode(errors='ignore') for p in file_info[b'path']])
+                files_to_log.append(full_path)
+            except Exception:
+                continue
     elif b'name' in info:
+        # 单文件种子
         try:
-            filename = info[b'name'].decode(errors='ignore')
-            filenames_to_check.append(filename)
+            files_to_log.append(info[b'name'].decode(errors='ignore'))
         except Exception:
-            pass  # 如果解码失败，列表将为空
+            pass
 
-    # 遍历收集到的文件名并使用分类器检查
-    for filename in filenames_to_check:
-        if is_porn_video(filename):
-            print(f"  [分类器] 检测到可疑文件: {filename}")
-            return True  # 只要有一个文件被识别，就返回True
+    # 2. 遍历文件，进行分类和日志记录
+    with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        for file_path in files_to_log:
+            # 创建一个更有描述性的文件名，用于日志记录
+            log_filepath = f"{torrent_name} / {file_path}"
 
-    # 如果所有文件都未被识别，则返回False
-    return False
+            # 进行分类
+            is_porn = is_porn_video(file_path)
+            label = 1 if is_porn else 0
+
+            # 写入CSV
+            writer.writerow([log_filepath, label])
+
+            if is_porn:
+                print(f"  [分类器] 检测到可疑文件: {log_filepath}")
+                is_torrent_flagged = True  # 标记整个种子为可疑
+
+    return is_torrent_flagged
 
 
 async def add_task_to_downloader(infohash_hex, torrent_file_path):
@@ -105,6 +127,8 @@ async def add_task_to_downloader(infohash_hex, torrent_file_path):
 
 async def main():
     loop = asyncio.get_running_loop()
+    # 初始化CSV日志文件
+    setup_csv_log()
 
     # 定义当爬虫发现新infohash时的回调函数
     async def on_infohash_discovered(infohash, peer_addr):
@@ -150,7 +174,7 @@ async def main():
                     # ======================================================
                     # 使用分类器检查文件名, 如果是可疑内容则提交任务
                     # ======================================================
-                    if is_porn_torrent(info):
+                    if is_porn_torrent(info, name):
                         print(f"  [检查] 分类器检测到可疑内容, 准备提交任务。")
                         # 传入infohash和文件路径
                         await add_task_to_downloader(infohash_hex, file_path)

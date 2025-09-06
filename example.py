@@ -70,19 +70,21 @@ def is_porn_torrent(info, torrent_name):
     with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         for file_path in files_to_log:
-            # 创建一个更有描述性的文件名，用于日志记录
-            log_filepath = f"{torrent_name} / {file_path}"
+            # 只处理 .mp4 和 .mkv 文件
+            if file_path.lower().endswith(('.mp4', '.mkv')):
+                # 创建一个更有描述性的文件名，用于日志记录
+                log_filepath = f"{torrent_name} / {file_path}"
 
-            # 进行分类
-            is_porn = is_porn_video(file_path)
-            label = 1 if is_porn else 0
+                # 进行分类
+                is_porn = is_porn_video(file_path)
+                label = 1 if is_porn else 0
 
-            # 写入CSV
-            writer.writerow([log_filepath, label])
+                # 写入CSV
+                writer.writerow([log_filepath, label])
 
-            if is_porn:
-                print(f"  [分类器] 检测到可疑文件: {log_filepath}")
-                is_torrent_flagged = True  # 标记整个种子为可疑
+                if is_porn:
+                    print(f"  [分类器] 检测到可疑文件: {log_filepath}")
+                    is_torrent_flagged = True  # 标记整个种子为可疑
 
     return is_torrent_flagged
 
@@ -172,14 +174,15 @@ async def main():
                     print(f"  已保存到: {file_path}")
 
                     # ======================================================
-                    # 使用分类器检查文件名, 如果是可疑内容则提交任务
+                    # 使用分类器检查文件名, 并记录结果, 但不提交任务
                     # ======================================================
                     if is_porn_torrent(info, name):
-                        print(f"  [检查] 分类器检测到可疑内容, 准备提交任务。")
-                        # 传入infohash和文件路径
-                        await add_task_to_downloader(infohash_hex, file_path)
+                        print(f"  [检查] 分类器检测到可疑内容。")
+                        # print(f"  [检查] 分类器检测到可疑内容, 准备提交任务。")
+                        # # 传入infohash和文件路径
+                        # await add_task_to_downloader(infohash_hex, file_path)
                     else:
-                        print(f"  [检查] 分类器未检测到可疑内容, 跳过任务提交。")
+                        print(f"  [检查] 分类器未检测到可疑内容。")
 
                     print("=" * 70 + "\n")
 

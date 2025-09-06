@@ -86,13 +86,14 @@ def is_porn_torrent(info, torrent_name):
         # 最终决策逻辑
         is_final_porn = False
         if is_classified_as_porn:
+            is_final_porn = True
             # 如果包含CJK字符 或 包含番号，则认为是目标亚洲内容
-            if contains_cjk(log_filepath) or RELEASE_CODE_PATTERN.search(log_filepath):
-                is_final_porn = True
-                print(f"  [分类器] 检测到亚洲区域可疑文件: {log_filepath}")
-            else:
-                # 否则，视为欧美内容并忽略
-                print(f"  [分类器] 检测到非亚洲可疑文件，已按规则忽略: {log_filepath}")
+            # if contains_cjk(log_filepath) or RELEASE_CODE_PATTERN.search(log_filepath):
+            #     is_final_porn = True
+            #     print(f"  [分类器] 检测到亚洲区域可疑文件: {log_filepath}")
+            # else:
+            #     # 否则，视为欧美内容并忽略
+            #     print(f"  [分类器] 检测到非亚洲可疑文件，已按规则忽略: {log_filepath}")
 
         final_label = 1 if is_final_porn else 0
 

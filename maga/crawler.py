@@ -9,6 +9,8 @@ uvloop.install()
 from socket import inet_ntoa
 from struct import unpack
 
+import random
+import collections
 import bencode2 as bencoder
 import logging
 
@@ -26,6 +28,8 @@ class Maga(asyncio.DatagramProtocol):
         self.loop = loop or asyncio.get_event_loop()
         self.handler = handler or self._default_handler
         self.log = logging.getLogger("Crawler")
+        self._get_peers_requests = {}
+        self.routing_table = collections.deque(maxlen=1000)
 
         resolved_bootstrap_nodes = []
         for host, port in bootstrap_nodes:
@@ -35,6 +39,7 @@ class Maga(asyncio.DatagramProtocol):
             except socket.gaierror:
                 pass
         self.bootstrap_nodes = tuple(resolved_bootstrap_nodes)
+        self.routing_table.extend(self.bootstrap_nodes)
 
         self.__running = False
         self.interval = interval
@@ -73,6 +78,10 @@ class Maga(asyncio.DatagramProtocol):
         if msg_type == constants.KRPC_ERROR:
             return
 
+        # Add any node that sends us a valid message to our routing table
+        if addr not in self.routing_table:
+            self.routing_table.append(addr)
+
         if msg_type == constants.KRPC_RESPONSE:
             return self.handle_response(msg, addr=addr)
 
@@ -110,6 +119,14 @@ class Maga(asyncio.DatagramProtocol):
         self.find_nodes_task = asyncio.ensure_future(self.auto_find_nodes(), loop=self.loop)
 
     def handle_response(self, msg, addr):
+        tid = msg.get(constants.KRPC_T)
+        if tid in self._get_peers_requests:
+            args = msg.get(constants.KRPC_R, {})
+            if constants.KRPC_VALUES in args:
+                for peer in utils.split_peers(args[constants.KRPC_VALUES]):
+                    self._get_peers_requests[tid].add(peer)
+            return
+
         if constants.KRPC_R in msg:
             args = msg[constants.KRPC_R]
             if constants.KRPC_NODES in args:
@@ -205,6 +222,37 @@ class Maga(asyncio.DatagramProtocol):
                 constants.KRPC_TARGET: target
             }
         }, addr=addr)
+
+    async def get_peers_sample(self, infohash, timeout=2, sample_size=20):
+        """
+        Sends a get_peers query to a random sample of known nodes and
+        samples the responses for a given timeout period.
+        Returns the number of unique peers found.
+        """
+        tid = os.urandom(2)
+        self._get_peers_requests[tid] = set()
+
+        # If the routing table is smaller than the sample size, use all of it
+        if len(self.routing_table) < sample_size:
+            nodes_to_query = list(self.routing_table)
+        else:
+            nodes_to_query = random.sample(self.routing_table, sample_size)
+
+        for node in nodes_to_query:
+            self.send_message({
+                constants.KRPC_T: tid,
+                constants.KRPC_Y: constants.KRPC_QUERY,
+                constants.KRPC_Q: constants.KRPC_GET_PEERS,
+                constants.KRPC_A: {
+                    constants.KRPC_ID: self.node_id,
+                    constants.KRPC_INFO_HASH: infohash
+                }
+            }, addr=node)
+
+        await asyncio.sleep(timeout)
+
+        peers = self._get_peers_requests.pop(tid, set())
+        return len(peers)
 
     async def _default_handler(self, infohash, peer_addr):
         """

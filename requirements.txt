@@ -1,3 +1,5 @@
 bencode2
 uvloop
 av
+aiohttp
+elasticsearch-async

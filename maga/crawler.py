@@ -9,6 +9,7 @@ uvloop.install()
 from socket import inet_ntoa
 from struct import unpack
 
+from datetime import datetime
 import random
 import collections
 import bencode2 as bencoder
@@ -20,6 +21,8 @@ from . import constants
 
 __version__ = '3.0.0'
 
+ROUTING_TABLE_MAX_SIZE = 1000
+
 
 class Maga(asyncio.DatagramProtocol):
     def __init__(self, loop=None, bootstrap_nodes=constants.BOOTSTRAP_NODES, interval=1, handler=None):
@@ -28,18 +31,24 @@ class Maga(asyncio.DatagramProtocol):
         self.loop = loop or asyncio.get_event_loop()
         self.handler = handler or self._default_handler
         self.log = logging.getLogger("Crawler")
-        self._get_peers_requests = {}
-        self.routing_table = collections.deque(maxlen=1000)
+        self._pending_queries = {}
+        self.routing_table = {}
 
         resolved_bootstrap_nodes = []
+        now = datetime.utcnow()
         for host, port in bootstrap_nodes:
             try:
                 ip = socket.gethostbyname(host)
-                resolved_bootstrap_nodes.append((ip, port))
+                addr = (ip, port)
+                resolved_bootstrap_nodes.append(addr)
+                self.routing_table[addr] = {
+                    "last_seen": now,
+                    "first_seen": now,
+                    "response_count": 0
+                }
             except socket.gaierror:
                 pass
         self.bootstrap_nodes = tuple(resolved_bootstrap_nodes)
-        self.routing_table.extend(self.bootstrap_nodes)
 
         self.__running = False
         self.interval = interval
@@ -78,9 +87,12 @@ class Maga(asyncio.DatagramProtocol):
         if msg_type == constants.KRPC_ERROR:
             return
 
-        # Add any node that sends us a valid message to our routing table
-        if addr not in self.routing_table:
-            self.routing_table.append(addr)
+        # Add the node to our routing table or update its last_seen time
+        asyncio.ensure_future(self._add_node(addr), loop=self.loop)
+
+        # If we know the node, update its last_seen time
+        if addr in self.routing_table:
+            self.routing_table[addr]["last_seen"] = datetime.utcnow()
 
         if msg_type == constants.KRPC_RESPONSE:
             return self.handle_response(msg, addr=addr)
@@ -119,12 +131,15 @@ class Maga(asyncio.DatagramProtocol):
         self.find_nodes_task = asyncio.ensure_future(self.auto_find_nodes(), loop=self.loop)
 
     def handle_response(self, msg, addr):
+        if addr in self.routing_table:
+            self.routing_table[addr]["response_count"] += 1
+
         tid = msg.get(constants.KRPC_T)
-        if tid in self._get_peers_requests:
-            args = msg.get(constants.KRPC_R, {})
-            if constants.KRPC_VALUES in args:
-                for peer in utils.split_peers(args[constants.KRPC_VALUES]):
-                    self._get_peers_requests[tid].add(peer)
+        if tid in self._pending_queries:
+            # The future is just waiting for any valid response, not a specific one
+            # The caller will be responsible for parsing the response
+            future = self._pending_queries.pop(tid)
+            future.set_result(msg)
             return
 
         if constants.KRPC_R in msg:
@@ -223,36 +238,98 @@ class Maga(asyncio.DatagramProtocol):
             }
         }, addr=addr)
 
-    async def get_peers_sample(self, infohash, timeout=2, sample_size=20):
+    async def _send_query_and_wait(self, query_data, addr, timeout=2):
         """
-        Sends a get_peers query to a random sample of known nodes and
-        samples the responses for a given timeout period.
-        Returns the number of unique peers found.
+        Sends a query to a specific address and waits for a response.
         """
         tid = os.urandom(2)
-        self._get_peers_requests[tid] = set()
+        query_data[constants.KRPC_T] = tid
 
-        # If the routing table is smaller than the sample size, use all of it
-        if len(self.routing_table) < sample_size:
-            nodes_to_query = list(self.routing_table)
+        future = self.loop.create_future()
+        self._pending_queries[tid] = future
+
+        self.send_message(query_data, addr)
+
+        try:
+            return await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            self._pending_queries.pop(tid, None)
+
+    async def get_peers_sample(self, infohash, sample_size=20):
+        """
+        Sends a get_peers query to a random sample of known nodes and
+        counts the number of unique peers found.
+        """
+        table_keys = list(self.routing_table.keys())
+        if len(table_keys) < sample_size:
+            nodes_to_query = table_keys
         else:
-            nodes_to_query = random.sample(self.routing_table, sample_size)
+            nodes_to_query = random.sample(table_keys, sample_size)
 
-        for node in nodes_to_query:
-            self.send_message({
-                constants.KRPC_T: tid,
-                constants.KRPC_Y: constants.KRPC_QUERY,
-                constants.KRPC_Q: constants.KRPC_GET_PEERS,
-                constants.KRPC_A: {
-                    constants.KRPC_ID: self.node_id,
-                    constants.KRPC_INFO_HASH: infohash
-                }
-            }, addr=node)
+        query_data = {
+            constants.KRPC_Y: constants.KRPC_QUERY,
+            constants.KRPC_Q: constants.KRPC_GET_PEERS,
+            constants.KRPC_A: {
+                constants.KRPC_ID: self.node_id,
+                constants.KRPC_INFO_HASH: infohash
+            }
+        }
 
-        await asyncio.sleep(timeout)
+        tasks = [self._send_query_and_wait(query_data, addr) for addr in nodes_to_query]
+        responses = await asyncio.gather(*tasks)
 
-        peers = self._get_peers_requests.pop(tid, set())
+        peers = set()
+        for msg in responses:
+            if msg:
+                args = msg.get(constants.KRPC_R, {})
+                if constants.KRPC_VALUES in args:
+                    for peer in utils.split_peers(args[constants.KRPC_VALUES]):
+                        peers.add(peer)
         return len(peers)
+
+    async def _add_node(self, addr):
+        if addr in self.routing_table:
+            return
+
+        if len(self.routing_table) < ROUTING_TABLE_MAX_SIZE:
+            self.routing_table[addr] = {
+                "last_seen": datetime.utcnow(),
+                "first_seen": datetime.utcnow(),
+                "response_count": 0
+            }
+            return
+
+        # Table is full, find the worst node to challenge
+        # "Worst" is oldest last_seen and lowest response_count
+        worst_node_addr = min(
+            self.routing_table,
+            key=lambda k: (self.routing_table[k]['last_seen'], self.routing_table[k]['response_count'])
+        )
+
+        # Challenge the worst node
+        ping_query = {
+            constants.KRPC_Y: constants.KRPC_QUERY,
+            constants.KRPC_Q: constants.KRPC_PING,
+            constants.KRPC_A: {
+                constants.KRPC_ID: self.node_id
+            }
+        }
+        response = await self._send_query_and_wait(ping_query, worst_node_addr, timeout=1)
+
+        if response is None:
+            # Worst node did not respond, evict it and add the new one
+            self.routing_table.pop(worst_node_addr)
+            self.routing_table[addr] = {
+                "last_seen": datetime.utcnow(),
+                "first_seen": datetime.utcnow(),
+                "response_count": 0
+            }
+        else:
+            # Worst node responded, keep it (its last_seen is already updated)
+            # and discard the new node candidate.
+            pass
 
     async def _default_handler(self, infohash, peer_addr):
         """

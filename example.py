@@ -180,22 +180,6 @@ async def create_es_index_if_not_exists(es_client):
                 raise e # 如果还是不存在，则抛出异常
 
 
-async def increment_discovery_count(es_client, infohash_hex):
-    """
-    为一个已存在的种子增加其发现计数值。
-    这是一个轻量级的操作，用于追踪趋势。
-    """
-    try:
-        script = {
-            "source": "ctx._source.discovery_count_since_last_check += 1"
-        }
-        # 使用ignore=[404]来避免在文档不存在时（即种子是新的）抛出错误
-        await es_client.update(index=ES_INDEX_NAME, id=infohash_hex, body={"script": script}, ignore=[404])
-    except Exception as e:
-        # 记录更新失败的错误，但不应中断主程序
-        print(f"  [ES] 更新发现次数失败: {infohash_hex} -> {e}")
-
-
 async def save_metadata_to_es(es_client, infohash_hex, info):
     """
     将获取到的元数据格式化并保存到Elasticsearch中。
@@ -324,10 +308,56 @@ async def peer_checker_task(crawler, es_client):
             print(f"[Peer Checker] 发生错误: {e}")
 
 
+async def discovery_updater_task(queue, es_client):
+    """
+    消费者任务，从队列中获取infohash并批量更新到Elasticsearch。
+    """
+    while True:
+        try:
+            batch = []
+            # 从队列中获取第一个项目，会在此等待直到有项目可用
+            first_item = await queue.get()
+            batch.append(first_item)
+
+            # 尝试获取更多项目以进行批处理，但不阻塞
+            while len(batch) < 200 and not queue.empty():
+                batch.append(queue.get_nowait())
+
+            # 准备批量更新请求
+            bulk_operations = []
+            for infohash_hex in batch:
+                op = {
+                    "update": {
+                        "_index": ES_INDEX_NAME,
+                        "_id": infohash_hex
+                    }
+                }
+                script = {
+                    "script": {
+                        "source": "ctx._source.discovery_count_since_last_check += 1",
+                        "lang": "painless"
+                    }
+                }
+                bulk_operations.append(op)
+                bulk_operations.append(script)
+
+            if bulk_operations:
+                await es_client.bulk(body=bulk_operations)
+                # print(f"[Discovery Updater] 批量更新了 {len(batch)} 个种子的发现次数。")
+
+        except asyncio.CancelledError:
+            print("[Discovery Updater] 任务被取消，正在退出...")
+            break
+        except Exception as e:
+            print(f"[Discovery Updater] 发生错误: {e}")
+
+
 async def main():
     loop = asyncio.get_running_loop()
     # 创建一个信号量，限制并发下载任务为100
     download_semaphore = asyncio.Semaphore(100)
+    # 创建一个队列，用于解耦发现和数据库更新
+    discovery_queue = asyncio.Queue(maxsize=10000)
 
     # 创建一个可复用的 aiohttp.ClientSession 和 AsyncElasticsearch 客户端
     # 使用 async with 来确保在程序退出时资源被正确关闭
@@ -338,12 +368,15 @@ async def main():
         await create_es_index_if_not_exists(es_client)
 
         # 定义当爬虫发现新infohash时的回调函数
-        # 这个函数可以访问外部作用域的 session, es_client 和 semaphore 变量
+        # 这个函数可以访问外部作用域的 session, es_client, semaphore 和 queue 变量
         async def on_infohash_discovered(infohash, peer_addr):
             infohash_hex = binascii.hexlify(infohash).decode()
 
-            # 无论种子新旧，都先为其发现次数+1
-            await increment_discovery_count(es_client, infohash_hex)
+            # 生产者：将发现的infohash放入队列，这是一个非阻塞操作
+            try:
+                discovery_queue.put_nowait(infohash_hex)
+            except asyncio.QueueFull:
+                pass  # 如果队列满了，暂时丢弃，避免阻塞
 
             # 使用信号量来控制并发，仅对新种子进行元数据下载
             async with download_semaphore:
@@ -407,9 +440,10 @@ async def main():
         crawler = Maga(loop=loop, handler=on_infohash_discovered)
         await crawler.run(port=6981)
 
-        # 启动后台节点检查任务
+        # 启动后台任务
         checker_task = asyncio.create_task(peer_checker_task(crawler, es_client))
-        print("后台节点检查任务已启动。")
+        updater_task = asyncio.create_task(discovery_updater_task(discovery_queue, es_client))
+        print("后台任务（节点检查、发现次数更新）已启动。")
 
         print("服务已启动，正在后台监听和下载...")
         print("只有成功下载的种子才会被打印出来。")
@@ -423,8 +457,9 @@ async def main():
         # 优雅地关闭服务
         print("\n正在停止服务...")
         checker_task.cancel()
+        updater_task.cancel()
         crawler.stop()
-        await asyncio.gather(checker_task, return_exceptions=True)
+        await asyncio.gather(checker_task, updater_task, return_exceptions=True)
         print("服务已停止。")
 
 

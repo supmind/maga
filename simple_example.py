@@ -42,24 +42,24 @@ class SimpleCrawler(Maga):
         This is the main handler for discovered infohashes.
         It's called by `handle_get_peers` and `handle_announce_peer` in the base class.
         """
+        # Per the new requirement, we only want to download metadata for infohashes
+        # that are actively announced by a peer. These calls provide a `peer_addr`.
+        # If `peer_addr` is None, this infohash came from a `get_peers` request, and we ignore it.
+        if not peer_addr:
+            return
+
         infohash_hex = binascii.hexlify(infohash).decode()
 
         # Ignore if we've already processed this infohash
         if infohash_hex in PROCESSED_INFOHASHES:
             return
 
-        log.info(f"Discovered new infohash: {infohash_hex} from {addr}")
+        log.info(f"Discovered infohash via announce_peer: {infohash_hex} from peer {peer_addr}")
         PROCESSED_INFOHASHES.add(infohash_hex)
 
-        # The peer address is necessary to download metadata
-        # In a get_peers query, we don't have a specific peer, just the DHT node.
-        # In an announce_peer query, we get the peer_addr.
-        target_addr = peer_addr or addr
-
-        # Asynchronously download metadata
-        # The loop object is fetched from the running event loop
+        # Asynchronously download metadata from the announcing peer
         loop = asyncio.get_running_loop()
-        info = await get_metadata(infohash, target_addr[0], target_addr[1], loop=loop)
+        info = await get_metadata(infohash, peer_addr[0], peer_addr[1], loop=loop)
 
         if info:
             name = info.get(b'name', b'Unknown').decode(errors='ignore')

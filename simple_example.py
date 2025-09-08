@@ -37,6 +37,10 @@ class SimpleCrawler(Maga):
     """
     A simple crawler that demonstrates core functionality.
     """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.download_semaphore = asyncio.Semaphore(100)
+
     async def handler(self, infohash, addr, peer_addr=None):
         """
         This is the main handler for discovered infohashes.
@@ -56,9 +60,11 @@ class SimpleCrawler(Maga):
 
         log.info(f"Discovered infohash via announce_peer: {infohash_hex} from peer {peer_addr}. Attempting metadata download.")
 
-        # Asynchronously download metadata from the announcing peer
-        loop = asyncio.get_running_loop()
-        info = await get_metadata(infohash, peer_addr[0], peer_addr[1], loop=loop)
+        # Use a semaphore to limit the number of concurrent metadata downloads
+        async with self.download_semaphore:
+            # Asynchronously download metadata from the announcing peer
+            loop = asyncio.get_running_loop()
+            info = await get_metadata(infohash, peer_addr[0], peer_addr[1], loop=loop)
 
         if info:
             # Only add to the processed set if the download was successful

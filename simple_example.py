@@ -54,14 +54,16 @@ class SimpleCrawler(Maga):
         if infohash_hex in PROCESSED_INFOHASHES:
             return
 
-        log.info(f"Discovered infohash via announce_peer: {infohash_hex} from peer {peer_addr}")
-        PROCESSED_INFOHASHES.add(infohash_hex)
+        log.info(f"Discovered infohash via announce_peer: {infohash_hex} from peer {peer_addr}. Attempting metadata download.")
 
         # Asynchronously download metadata from the announcing peer
         loop = asyncio.get_running_loop()
         info = await get_metadata(infohash, peer_addr[0], peer_addr[1], loop=loop)
 
         if info:
+            # Only add to the processed set if the download was successful
+            PROCESSED_INFOHASHES.add(infohash_hex)
+
             name = info.get(b'name', b'Unknown').decode(errors='ignore')
             if b'files' in info:
                 num_files = len(info[b'files'])

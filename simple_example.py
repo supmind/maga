@@ -6,7 +6,7 @@ import collections
 import argparse
 
 from maga.crawler import Maga
-from maga.downloader import get_metadata
+from maga.downloader import get_metadata, CLIENT_INSTANCES
 from maga.utils import proper_infohash
 
 # Configure basic logging to see the output from the crawler and this script
@@ -168,7 +168,8 @@ async def print_stats(crawler, task_queue):
             f"[STATS] DHT Nodes: {stats['total_nodes']} | "
             f"Queue Size: {task_queue.qsize()}/{task_queue.maxsize} | "
             f"Queued Hashes: {len(QUEUED_INFOHASHES.deque)} | "
-            f"Processed Hashes: {len(PROCESSED_INFOHASHES.deque)}"
+            f"Processed Hashes: {len(PROCESSED_INFOHASHES.deque)} | "
+            f"Clients Created: {CLIENT_INSTANCES}"
         )
 
 

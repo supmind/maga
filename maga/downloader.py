@@ -8,6 +8,11 @@ from fastbencode import bencode, bdecode
 from . import utils
 
 
+# Global counter to track the number of WirePeerClient instances created.
+# This is for debugging a suspected memory leak.
+CLIENT_INSTANCES = 0
+
+
 class MessageType:
     REQUEST = 0
     DATA = 1
@@ -41,6 +46,8 @@ def get_metadata_size(data):
 
 class WirePeerClient:
     def __init__(self, infohash, loop=None):
+        global CLIENT_INSTANCES
+        CLIENT_INSTANCES += 1
         if isinstance(infohash, str):
             infohash = binascii.unhexlify(infohash.upper())
         self.infohash = infohash

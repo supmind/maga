@@ -7,6 +7,7 @@ import argparse
 
 from maga.crawler import Maga
 from maga.downloader import get_metadata
+from maga.utils import proper_infohash
 
 # Configure basic logging to see the output from the crawler and this script
 logging.basicConfig(
@@ -42,8 +43,11 @@ class BoundedSet:
         return item in self.set
 
 
-# Use a BoundedSet to keep track of infohashes to prevent memory leaks.
+# A set to track infohashes that have been successfully processed (metadata downloaded).
 PROCESSED_INFOHASHES = BoundedSet(max_size=1_000_000)
+# A set to track infohashes that have been added to the download queue.
+# This prevents adding the same task to the queue multiple times.
+QUEUED_INFOHASHES = BoundedSet(max_size=1_000_000)
 
 
 def format_bytes(size):
@@ -67,22 +71,21 @@ async def metadata_downloader(task_queue):
     while True:
         try:
             infohash, peer_addr = await task_queue.get()
-            infohash_hex = binascii.hexlify(infohash).decode()
+            # Use proper_infohash for consistent, case-insensitive handling
+            infohash_hex = proper_infohash(infohash)
 
-            # The BoundedSet `add` method returns False if the item already exists.
-            # We use it here to de-duplicate tasks from the queue and to mark
-            # an infohash as "seen" before we attempt to download it.
-            if not PROCESSED_INFOHASHES.add(infohash_hex):
-                task_queue.task_done()
-                continue
-
+            # Since deduplication is now handled by the producer, we can directly
+            # attempt to download the metadata.
             log.info(f"Processing infohash: {infohash_hex} from peer {peer_addr}")
 
             # Asynchronously download metadata from the announcing peer
             loop = asyncio.get_running_loop()
-            info = await get_metadata(infohash, peer_addr[0], peer_addr[1], loop=loop, timeout=2)
+            info = await get_metadata(infohash, peer_addr[0], peer_addr[1], loop=loop, timeout=10)
 
             if info:
+                # Only add the infohash to the processed set AFTER a successful download.
+                PROCESSED_INFOHASHES.add(infohash_hex)
+
                 name = info.get(b'name', b'Unknown').decode(errors='ignore')
                 if b'files' in info:
                     num_files = len(info[b'files'])
@@ -112,9 +115,10 @@ class SimpleCrawler(Maga):
     This is the "producer". It discovers infohashes and puts them into
     the task queue.
     """
-    def __init__(self, task_queue, *args, **kwargs):
+    def __init__(self, task_queue, queued_hashes, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.task_queue = task_queue
+        self.queued_hashes = queued_hashes
 
     async def handler(self, infohash, addr, peer_addr=None):
         """
@@ -124,10 +128,20 @@ class SimpleCrawler(Maga):
         if not peer_addr:
             return
 
-        try:
-            self.task_queue.put_nowait((infohash, peer_addr))
-        except asyncio.QueueFull:
-            pass # Drop the task if the queue is full
+        # Use proper_infohash for consistent, case-insensitive checking
+        infohash_hex = proper_infohash(infohash)
+
+        # The `add` method of our BoundedSet returns True if the item is new
+        # and was successfully added. We use this to ensure we only queue a
+        # given infohash once.
+        if self.queued_hashes.add(infohash_hex):
+            try:
+                self.task_queue.put_nowait((infohash, peer_addr))
+            except asyncio.QueueFull:
+                # The task is dropped, but the hash remains in `queued_hashes`
+                # to prevent a tight loop of re-queueing a task that can't be
+                # processed right now.
+                pass
 
 
     def get_routing_table_stats(self):
@@ -152,6 +166,7 @@ async def print_stats(crawler, task_queue):
         log.info(
             f"[STATS] DHT Nodes: {stats['total_nodes']} | "
             f"Queue Size: {task_queue.qsize()}/{task_queue.maxsize} | "
+            f"Queued Hashes: {len(QUEUED_INFOHASHES.deque)} | "
             f"Processed Hashes: {len(PROCESSED_INFOHASHES.deque)}"
         )
 
@@ -167,7 +182,10 @@ async def main(args):
     task_queue = asyncio.Queue(maxsize=2000)
 
     # The crawler acts as the producer
-    crawler = SimpleCrawler(task_queue=task_queue)
+    crawler = SimpleCrawler(
+        task_queue=task_queue,
+        queued_hashes=QUEUED_INFOHASHES
+    )
 
     # The number of workers determines the download concurrency
     num_workers = args.workers

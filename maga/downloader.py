@@ -4,7 +4,7 @@ import binascii
 import struct
 import math
 
-import bencode2 as bencoder
+from fastbencode import bencode, bdecode
 from . import utils
 
 
@@ -18,7 +18,7 @@ BT_PROTOCOL = "BitTorrent protocol"
 BT_PROTOCOL_LEN = len(BT_PROTOCOL)
 EXT_ID = 20
 EXT_HANDSHAKE_ID = 0
-EXT_HANDSHAKE_MESSAGE = bytes([EXT_ID, EXT_HANDSHAKE_ID]) + bencoder.bencode({"m": {"ut_metadata": 1}})
+EXT_HANDSHAKE_MESSAGE = bytes([EXT_ID, EXT_HANDSHAKE_ID]) + bencode({b"m": {b"ut_metadata": 1}})
 
 BLOCK = math.pow(2, 14)
 MAX_SIZE = BLOCK * 1000
@@ -62,9 +62,11 @@ class WirePeerClient:
             ip, port
         )
 
-    def close(self):
+    async def close(self):
         try:
-            self.writer.close()
+            if self.writer:
+                self.writer.close()
+                await self.writer.wait_closed()
         except:
             pass
 
@@ -82,20 +84,20 @@ class WirePeerClient:
         self.writer.write(length + message)
 
     def request_piece(self, piece):
-        msg = bytes([EXT_ID, self.ut_metadata]) + bencoder.bencode({"msg_type": 0, "piece": piece})
+        msg = bytes([EXT_ID, self.ut_metadata]) + bencode({b"msg_type": 0, b"piece": piece})
         self.write_message(msg)
 
-    def pieces_complete(self):
+    async def pieces_complete(self):
         metainfo = b''.join(self.pieces)
 
         if len(metainfo) != self.metadata_size:
-            return self.close()
+            return await self.close()
 
         infohash = hashlib.sha1(metainfo).hexdigest()
         if binascii.unhexlify(infohash.upper()) != self.infohash:
-            return self.close()
+            return await self.close()
 
-        return bencoder.bdecode(metainfo)
+        return bdecode(metainfo)
 
     async def work(self):
         self.writer.write(BT_HEADER + self.infohash + self.peer_id)
@@ -106,7 +108,7 @@ class WirePeerClient:
                     self.handshaked = True
                     self.write_message(EXT_HANDSHAKE_MESSAGE)
                 else:
-                    return self.close()
+                    return await self.close()
 
             total_message_length, msg_id = struct.unpack("!IB", await self.reader.readexactly(5))
             payload_length = total_message_length - 1
@@ -119,8 +121,12 @@ class WirePeerClient:
                 try:
                     self.ut_metadata = get_ut_metadata(extend_payload)
                     self.metadata_size = get_metadata_size(extend_payload)
+                    if self.metadata_size > MAX_SIZE:
+                        # Peer is trying to send a file that is too large.
+                        # This is a common attack vector.
+                        return await self.close()
                 except:
-                    return self.close()
+                    return await self.close()
                 self.pieces_num = math.ceil(self.metadata_size / BLOCK)
                 self.pieces = [False] * self.pieces_num
                 self.request_piece(0)
@@ -128,33 +134,34 @@ class WirePeerClient:
 
             try:
                 split_index = extend_payload.index(b"ee")+2
-                info = bencoder.bdecode(extend_payload[:split_index])
+                info = bdecode(extend_payload[:split_index])
                 if info[b'msg_type'] != MessageType.DATA:
-                    return self.close()
+                    return await self.close()
                 if info[b'piece'] != self.pieces_received_num:
-                    return self.close()
+                    return await self.close()
                 self.pieces[info[b'piece']] = extend_payload[split_index:]
             except:
-                return self.close()
+                return await self.close()
             self.pieces_received_num += 1
             if self.pieces_received_num == self.pieces_num:
-                return self.pieces_complete()
+                return await self.pieces_complete()
             else:
                 self.request_piece(self.pieces_received_num)
 
 
-async def get_metadata(infohash, ip, port, loop=None):
+async def get_metadata(infohash, ip, port, loop=None, timeout=15):
     """
     Connects to a single peer and attempts to download the metadata.
     """
     client = WirePeerClient(infohash, loop=loop)
     try:
-        await client.connect(ip, port)
+        # The connection itself should also be subject to a timeout.
+        await asyncio.wait_for(client.connect(ip, port), timeout=timeout)
         # Use a timeout to prevent waiting forever on an unresponsive peer
-        metadata = await asyncio.wait_for(client.work(), timeout=15)
+        metadata = await asyncio.wait_for(client.work(), timeout=timeout)
         return metadata
     except Exception:
         # This will catch timeouts, connection errors, etc.
         return None
     finally:
-        client.close()
+        await client.close()

@@ -12,7 +12,7 @@ from struct import unpack
 from datetime import datetime, timezone
 import random
 import collections
-import bencode2 as bencoder
+from fastbencode import bencode, bdecode
 import logging
 
 from . import utils
@@ -62,7 +62,7 @@ class Maga(asyncio.DatagramProtocol):
 
     def datagram_received(self, data, addr):
         try:
-            msg = bencoder.bdecode(data)
+            msg = bdecode(data)
         except:
             return
         try:
@@ -77,7 +77,7 @@ class Maga(asyncio.DatagramProtocol):
 
     def send_message(self, data, addr):
         data.setdefault(constants.KRPC_T, constants.KRPC_DEFAULT_TID)
-        self.transport.sendto(bencoder.bencode(data), addr)
+        self.transport.sendto(bencode(data), addr)
 
     def handle_message(self, msg, addr):
         msg_type = msg.get(constants.KRPC_Y, constants.KRPC_ERROR)
@@ -171,7 +171,7 @@ class Maga(asyncio.DatagramProtocol):
                 constants.KRPC_Y: constants.KRPC_RESPONSE,
                 constants.KRPC_R: {
                     constants.KRPC_ID: self.fake_node_id(node_id),
-                    constants.KRPC_NODES: "",
+                    constants.KRPC_NODES: b"",
                     constants.KRPC_TOKEN: token
                 }
             }, addr=addr)
@@ -206,7 +206,7 @@ class Maga(asyncio.DatagramProtocol):
                 constants.KRPC_Y: constants.KRPC_RESPONSE,
                 constants.KRPC_R: {
                     constants.KRPC_ID: self.fake_node_id(node_id),
-                    constants.KRPC_NODES: ""
+                    constants.KRPC_NODES: b""
                 }
             }, addr=addr)
         elif query_type == constants.KRPC_PING:

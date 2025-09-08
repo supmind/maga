@@ -69,10 +69,8 @@ async def metadata_downloader(task_queue):
             infohash, peer_addr = await task_queue.get()
             infohash_hex = binascii.hexlify(infohash).decode()
 
-            # The BoundedSet `add` method returns False if the item already exists.
-            # We check here to avoid a race condition where multiple identical
-            # infohashes are added to the queue before the first one is processed.
-            if not PROCESSED_INFOHASHES.add(infohash_hex):
+            # First, check if this infohash has been successfully processed already.
+            if infohash_hex in PROCESSED_INFOHASHES:
                 task_queue.task_done()
                 continue
 
@@ -83,6 +81,8 @@ async def metadata_downloader(task_queue):
             info = await get_metadata(infohash, peer_addr[0], peer_addr[1], loop=loop, timeout=10)
 
             if info:
+                # Only add the infohash to the processed set on successful download.
+                PROCESSED_INFOHASHES.add(infohash_hex)
                 name = info.get(b'name', b'Unknown').decode(errors='ignore')
                 if b'files' in info:
                     num_files = len(info[b'files'])

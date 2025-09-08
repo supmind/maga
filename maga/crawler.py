@@ -21,7 +21,7 @@ from . import constants
 
 __version__ = '3.0.0'
 
-ROUTING_TABLE_MAX_SIZE = 1000
+K = 8
 
 
 class Maga(asyncio.DatagramProtocol):
@@ -32,20 +32,16 @@ class Maga(asyncio.DatagramProtocol):
         self.handler = handler or self._default_handler
         self.log = logging.getLogger("Crawler")
         self._pending_queries = {}
-        self.routing_table = {}
+        self.k_buckets = [collections.deque(maxlen=K) for _ in range(160)]
 
         resolved_bootstrap_nodes = []
-        now = datetime.utcnow()
         for host, port in bootstrap_nodes:
             try:
                 ip = socket.gethostbyname(host)
                 addr = (ip, port)
                 resolved_bootstrap_nodes.append(addr)
-                self.routing_table[addr] = {
-                    "last_seen": now,
-                    "first_seen": now,
-                    "response_count": 0
-                }
+                # Bootstrap nodes don't have IDs, so we can't place them in k-buckets yet.
+                # The _add_node logic will handle them when they communicate.
             except socket.gaierror:
                 pass
         self.bootstrap_nodes = tuple(resolved_bootstrap_nodes)
@@ -83,24 +79,28 @@ class Maga(asyncio.DatagramProtocol):
 
     def handle_message(self, msg, addr):
         msg_type = msg.get(constants.KRPC_Y, constants.KRPC_ERROR)
-
         if msg_type == constants.KRPC_ERROR:
             return
 
-        # Add the node to our routing table or update its last_seen time
-        asyncio.ensure_future(self._add_node(addr), loop=self.loop)
-
-        # If we know the node, update its last_seen time
-        if addr in self.routing_table:
-            self.routing_table[addr]["last_seen"] = datetime.utcnow()
+        try:
+            node_id = msg[constants.KRPC_A][constants.KRPC_ID]
+            asyncio.ensure_future(self._add_node(node_id, addr), loop=self.loop)
+        except KeyError:
+            # This happens on response messages, where the node ID is not present
+            # in the top-level 'a' dictionary. We handle this by finding the node
+            # by its address and updating its last_seen time.
+            for bucket in self.k_buckets:
+                node = next((n for n in bucket if n["addr"] == addr), None)
+                if node:
+                    node["last_seen"] = datetime.utcnow()
+                    bucket.remove(node)
+                    bucket.append(node)
+                    break
 
         if msg_type == constants.KRPC_RESPONSE:
-            return self.handle_response(msg, addr=addr)
-
-        if msg_type == constants.KRPC_QUERY:
-            return asyncio.ensure_future(
-                self.handle_query(msg, addr=addr), loop=self.loop
-            )
+            return self.handle_response(msg, addr)
+        elif msg_type == constants.KRPC_QUERY:
+            return asyncio.ensure_future(self.handle_query(msg, addr), loop=self.loop)
 
     def stop(self):
         self.__running = False
@@ -131,8 +131,12 @@ class Maga(asyncio.DatagramProtocol):
         self.find_nodes_task = asyncio.ensure_future(self.auto_find_nodes(), loop=self.loop)
 
     def handle_response(self, msg, addr):
-        if addr in self.routing_table:
-            self.routing_table[addr]["response_count"] += 1
+        # A response from a node we know about is a good sign
+        for bucket in self.k_buckets:
+            node = next((n for n in bucket if n["addr"] == addr), None)
+            if node:
+                node["response_count"] += 1
+                break
 
         tid = msg.get(constants.KRPC_T)
         if tid in self._pending_queries:
@@ -140,13 +144,14 @@ class Maga(asyncio.DatagramProtocol):
             # The caller will be responsible for parsing the response
             future = self._pending_queries.pop(tid)
             future.set_result(msg)
-            return
+            # Don't return here, we might want to process the response further
 
-        if constants.KRPC_R in msg:
-            args = msg[constants.KRPC_R]
-            if constants.KRPC_NODES in args:
-                for node_id, ip, port in utils.split_nodes(args[constants.KRPC_NODES]):
-                    self.ping(addr=(ip, port))
+        # In addition to our own queries, we also learn about new nodes
+        # from other nodes' responses to us.
+        args = msg.get(constants.KRPC_R, {})
+        if constants.KRPC_NODES in args:
+            for node_id, ip, port in utils.split_nodes(args[constants.KRPC_NODES]):
+                asyncio.ensure_future(self._add_node(node_id, (ip, port)), loop=self.loop)
 
     async def handle_query(self, msg, addr):
         args = msg.get(constants.KRPC_A, {})
@@ -257,58 +262,93 @@ class Maga(asyncio.DatagramProtocol):
         finally:
             self._pending_queries.pop(tid, None)
 
-    async def get_peers_sample(self, infohash, sample_size=20):
+    async def get_peers_recursive(self, infohash, max_hops=2):
         """
-        Sends a get_peers query to a random sample of known nodes and
-        counts the number of unique peers found.
+        Performs a recursive, multi-hop get_peers query.
         """
-        table_keys = list(self.routing_table.keys())
-        if len(table_keys) < sample_size:
-            nodes_to_query = table_keys
-        else:
-            nodes_to_query = random.sample(table_keys, sample_size)
-
-        query_data = {
-            constants.KRPC_Y: constants.KRPC_QUERY,
-            constants.KRPC_Q: constants.KRPC_GET_PEERS,
-            constants.KRPC_A: {
-                constants.KRPC_ID: self.node_id,
-                constants.KRPC_INFO_HASH: infohash
-            }
-        }
-
-        tasks = [self._send_query_and_wait(query_data, addr) for addr in nodes_to_query]
-        responses = await asyncio.gather(*tasks)
-
         peers = set()
-        for msg in responses:
-            if msg:
+        queried_nodes = set()
+
+        # Start with the closest nodes from our own k-buckets
+        bucket_index = self._get_bucket_index(infohash)
+        nodes_to_query = [node["addr"] for node in self.k_buckets[bucket_index]]
+        if not nodes_to_query:
+            nodes_to_query = list(self.bootstrap_nodes)
+
+        for hop in range(max_hops):
+            query_data = {
+                constants.KRPC_Y: constants.KRPC_QUERY,
+                constants.KRPC_Q: constants.KRPC_GET_PEERS,
+                constants.KRPC_A: {
+                    constants.KRPC_ID: self.node_id,
+                    constants.KRPC_INFO_HASH: infohash
+                }
+            }
+
+            tasks = [self._send_query_and_wait(query_data, addr) for addr in nodes_to_query if addr not in queried_nodes]
+            queried_nodes.update(nodes_to_query)
+
+            if not tasks:
+                break
+
+            responses = await asyncio.gather(*tasks)
+
+            new_nodes_found = []
+            for msg in responses:
+                if not msg:
+                    continue
+
                 args = msg.get(constants.KRPC_R, {})
                 if constants.KRPC_VALUES in args:
                     for peer in utils.split_peers(args[constants.KRPC_VALUES]):
                         peers.add(peer)
+
+                if constants.KRPC_NODES in args:
+                    for node_id, ip, port in utils.split_nodes(args[constants.KRPC_NODES]):
+                        new_nodes_found.append((ip, port))
+
+            if peers:
+                # If we found peers, we can stop searching
+                break
+
+            # Prepare for the next hop
+            nodes_to_query = new_nodes_found
+
         return len(peers)
 
-    async def _add_node(self, addr):
-        if addr in self.routing_table:
+    def _get_bucket_index(self, node_id):
+        distance = utils.get_distance(self.node_id, node_id)
+        if distance == 0:
+            return 0
+        return distance.bit_length() - 1
+
+    async def _add_node(self, node_id, addr):
+        bucket_index = self._get_bucket_index(node_id)
+        bucket = self.k_buckets[bucket_index]
+
+        # Check if node already exists by ID
+        existing_node = next((n for n in bucket if n["id"] == node_id), None)
+        if existing_node:
+            # It exists, move it to the end to mark it as most recently seen
+            existing_node["last_seen"] = datetime.utcnow()
+            bucket.remove(existing_node)
+            bucket.append(existing_node)
             return
 
-        if len(self.routing_table) < ROUTING_TABLE_MAX_SIZE:
-            self.routing_table[addr] = {
+        # If bucket is not full, add the new node
+        if len(bucket) < K:
+            bucket.append({
+                "id": node_id,
+                "addr": addr,
                 "last_seen": datetime.utcnow(),
                 "first_seen": datetime.utcnow(),
                 "response_count": 0
-            }
+            })
             return
 
-        # Table is full, find the worst node to challenge
-        # "Worst" is oldest last_seen and lowest response_count
-        worst_node_addr = min(
-            self.routing_table,
-            key=lambda k: (self.routing_table[k]['last_seen'], self.routing_table[k]['response_count'])
-        )
+        # Bucket is full, challenge the least-recently-seen node (at the front)
+        lru_node = bucket[0]
 
-        # Challenge the worst node
         ping_query = {
             constants.KRPC_Y: constants.KRPC_QUERY,
             constants.KRPC_Q: constants.KRPC_PING,
@@ -316,20 +356,23 @@ class Maga(asyncio.DatagramProtocol):
                 constants.KRPC_ID: self.node_id
             }
         }
-        response = await self._send_query_and_wait(ping_query, worst_node_addr, timeout=1)
+        response = await self._send_query_and_wait(ping_query, lru_node["addr"], timeout=1)
 
         if response is None:
-            # Worst node did not respond, evict it and add the new one
-            self.routing_table.pop(worst_node_addr)
-            self.routing_table[addr] = {
+            # Node did not respond, evict it and add the new one
+            bucket.popleft() # popleft is more efficient for deque
+            bucket.append({
+                "id": node_id,
+                "addr": addr,
                 "last_seen": datetime.utcnow(),
                 "first_seen": datetime.utcnow(),
                 "response_count": 0
-            }
+            })
         else:
-            # Worst node responded, keep it (its last_seen is already updated)
-            # and discard the new node candidate.
-            pass
+            # Node responded, move it to the end and discard the new candidate
+            bucket.remove(lru_node)
+            lru_node["last_seen"] = datetime.utcnow()
+            bucket.append(lru_node)
 
     async def _default_handler(self, infohash, peer_addr):
         """

@@ -39,7 +39,7 @@ class SimpleCrawler(Maga):
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.download_semaphore = asyncio.Semaphore(400)
+        self.download_semaphore = asyncio.Semaphore(100)
 
     async def handler(self, infohash, addr, peer_addr=None):
         """

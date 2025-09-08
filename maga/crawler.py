@@ -29,7 +29,8 @@ class Maga(asyncio.DatagramProtocol):
         self.node_id = utils.random_node_id()
         self.transport = None
         self.loop = loop or asyncio.get_event_loop()
-        self.handler = handler or self._default_handler
+        if handler:
+            self.handler = handler
         self.log = logging.getLogger("Crawler")
         self._pending_queries = {}
         self.k_buckets = [collections.deque(maxlen=K) for _ in range(160)]
@@ -174,6 +175,9 @@ class Maga(asyncio.DatagramProtocol):
                     constants.KRPC_TOKEN: token
                 }
             }, addr=addr)
+            asyncio.ensure_future(
+                self.handle_get_peers(infohash, addr), loop=self.loop
+            )
         elif query_type == constants.KRPC_ANNOUNCE_PEER:
             infohash = args[constants.KRPC_INFO_HASH]
             tid = msg[constants.KRPC_T]
@@ -192,7 +196,7 @@ class Maga(asyncio.DatagramProtocol):
             peer_addr = (addr[0], peer_port)
 
             asyncio.ensure_future(
-                self.handler(infohash, peer_addr),
+                self.handle_announce_peer(infohash, addr, peer_addr),
                 loop=self.loop
             )
         elif query_type == constants.KRPC_FIND_NODE:
@@ -378,8 +382,20 @@ class Maga(asyncio.DatagramProtocol):
                 lru_node["last_seen"] = datetime.now(timezone.utc)
                 bucket.append(lru_node)
 
-    async def _default_handler(self, infohash, peer_addr):
+    async def handler(self, infohash, addr, peer_addr=None):
         """
         Default handler for discovered infohashes. Does nothing.
         """
-        pass
+        raise NotImplementedError
+
+    async def handle_get_peers(self, infohash, addr):
+        try:
+            await self.handler(infohash, addr)
+        except NotImplementedError:
+            pass
+
+    async def handle_announce_peer(self, infohash, addr, peer_addr):
+        try:
+            await self.handler(infohash, addr, peer_addr=peer_addr)
+        except NotImplementedError:
+            pass

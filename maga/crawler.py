@@ -33,6 +33,7 @@ class Maga(asyncio.DatagramProtocol):
         self.log = logging.getLogger("Crawler")
         self._pending_queries = {}
         self.k_buckets = [collections.deque(maxlen=K) for _ in range(160)]
+        self.k_bucket_locks = [asyncio.Lock() for _ in range(160)]
 
         resolved_bootstrap_nodes = []
         for host, port in bootstrap_nodes:
@@ -324,55 +325,58 @@ class Maga(asyncio.DatagramProtocol):
 
     async def _add_node(self, node_id, addr):
         bucket_index = self._get_bucket_index(node_id)
-        bucket = self.k_buckets[bucket_index]
+        lock = self.k_bucket_locks[bucket_index]
 
-        # Check if node already exists by ID
-        existing_node = next((n for n in bucket if n["id"] == node_id), None)
-        if existing_node:
-            # It exists, move it to the end to mark it as most recently seen
-            existing_node["last_seen"] = datetime.now(timezone.utc)
-            bucket.remove(existing_node)
-            bucket.append(existing_node)
-            return
+        async with lock:
+            bucket = self.k_buckets[bucket_index]
 
-        # If bucket is not full, add the new node
-        if len(bucket) < K:
-            bucket.append({
-                "id": node_id,
-                "addr": addr,
-                "last_seen": datetime.now(timezone.utc),
-                "first_seen": datetime.now(timezone.utc),
-                "response_count": 0
-            })
-            return
+            # Check if node already exists by ID
+            existing_node = next((n for n in bucket if n["id"] == node_id), None)
+            if existing_node:
+                # It exists, move it to the end to mark it as most recently seen
+                existing_node["last_seen"] = datetime.now(timezone.utc)
+                bucket.remove(existing_node)
+                bucket.append(existing_node)
+                return
 
-        # Bucket is full, challenge the least-recently-seen node (at the front)
-        lru_node = bucket[0]
+            # If bucket is not full, add the new node
+            if len(bucket) < K:
+                bucket.append({
+                    "id": node_id,
+                    "addr": addr,
+                    "last_seen": datetime.now(timezone.utc),
+                    "first_seen": datetime.now(timezone.utc),
+                    "response_count": 0
+                })
+                return
 
-        ping_query = {
-            constants.KRPC_Y: constants.KRPC_QUERY,
-            constants.KRPC_Q: constants.KRPC_PING,
-            constants.KRPC_A: {
-                constants.KRPC_ID: self.node_id
+            # Bucket is full, challenge the least-recently-seen node (at the front)
+            lru_node = bucket[0]
+
+            ping_query = {
+                constants.KRPC_Y: constants.KRPC_QUERY,
+                constants.KRPC_Q: constants.KRPC_PING,
+                constants.KRPC_A: {
+                    constants.KRPC_ID: self.node_id
+                }
             }
-        }
-        response = await self._send_query_and_wait(ping_query, lru_node["addr"], timeout=1)
+            response = await self._send_query_and_wait(ping_query, lru_node["addr"], timeout=1)
 
-        if response is None:
-            # Node did not respond, evict it and add the new one
-            bucket.popleft() # popleft is more efficient for deque
-            bucket.append({
-                "id": node_id,
-                "addr": addr,
-                "last_seen": datetime.now(timezone.utc),
-                "first_seen": datetime.now(timezone.utc),
-                "response_count": 0
-            })
-        else:
-            # Node responded, move it to the end and discard the new candidate
-            bucket.remove(lru_node)
-            lru_node["last_seen"] = datetime.now(timezone.utc)
-            bucket.append(lru_node)
+            if response is None:
+                # Node did not respond, evict it and add the new one
+                bucket.popleft() # popleft is more efficient for deque
+                bucket.append({
+                    "id": node_id,
+                    "addr": addr,
+                    "last_seen": datetime.now(timezone.utc),
+                    "first_seen": datetime.now(timezone.utc),
+                    "response_count": 0
+                })
+            else:
+                # Node responded, move it to the end and discard the new candidate
+                bucket.remove(lru_node)
+                lru_node["last_seen"] = datetime.now(timezone.utc)
+                bucket.append(lru_node)
 
     async def _default_handler(self, infohash, peer_addr):
         """

@@ -143,7 +143,7 @@ class WirePeerClient:
                 self.request_piece(self.pieces_received_num)
 
 
-async def get_metadata(infohash, ip, port, loop=None, timeout=10):
+async def get_metadata(infohash, ip, port, loop=None):
     """
     Connects to a single peer and attempts to download the metadata.
     """
@@ -151,7 +151,7 @@ async def get_metadata(infohash, ip, port, loop=None, timeout=10):
     try:
         await client.connect(ip, port)
         # Use a timeout to prevent waiting forever on an unresponsive peer
-        metadata = await asyncio.wait_for(client.work(), timeout=timeout)
+        metadata = await asyncio.wait_for(client.work(), timeout=15)
         return metadata
     except Exception:
         # This will catch timeouts, connection errors, etc.

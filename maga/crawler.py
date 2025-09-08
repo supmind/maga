@@ -171,7 +171,7 @@ class Maga(asyncio.DatagramProtocol):
                 constants.KRPC_Y: constants.KRPC_RESPONSE,
                 constants.KRPC_R: {
                     constants.KRPC_ID: self.fake_node_id(node_id),
-                    constants.KRPC_NODES: "",
+                    constants.KRPC_NODES: b"",
                     constants.KRPC_TOKEN: token
                 }
             }, addr=addr)
@@ -206,7 +206,7 @@ class Maga(asyncio.DatagramProtocol):
                 constants.KRPC_Y: constants.KRPC_RESPONSE,
                 constants.KRPC_R: {
                     constants.KRPC_ID: self.fake_node_id(node_id),
-                    constants.KRPC_NODES: ""
+                    constants.KRPC_NODES: b""
                 }
             }, addr=addr)
         elif query_type == constants.KRPC_PING:

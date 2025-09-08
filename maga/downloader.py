@@ -62,9 +62,11 @@ class WirePeerClient:
             ip, port
         )
 
-    def close(self):
+    async def close(self):
         try:
-            self.writer.close()
+            if self.writer:
+                self.writer.close()
+                await self.writer.wait_closed()
         except:
             pass
 
@@ -162,4 +164,4 @@ async def get_metadata(infohash, ip, port, loop=None, timeout=15):
         # This will catch timeouts, connection errors, etc.
         return None
     finally:
-        client.close()
+        await client.close()

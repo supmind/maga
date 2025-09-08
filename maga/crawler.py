@@ -9,7 +9,7 @@ uvloop.install()
 from socket import inet_ntoa
 from struct import unpack
 
-from datetime import datetime
+from datetime import datetime, timezone
 import random
 import collections
 import bencode2 as bencoder
@@ -92,7 +92,7 @@ class Maga(asyncio.DatagramProtocol):
             for bucket in self.k_buckets:
                 node = next((n for n in bucket if n["addr"] == addr), None)
                 if node:
-                    node["last_seen"] = datetime.utcnow()
+                    node["last_seen"] = datetime.now(timezone.utc)
                     bucket.remove(node)
                     bucket.append(node)
                     break
@@ -330,7 +330,7 @@ class Maga(asyncio.DatagramProtocol):
         existing_node = next((n for n in bucket if n["id"] == node_id), None)
         if existing_node:
             # It exists, move it to the end to mark it as most recently seen
-            existing_node["last_seen"] = datetime.utcnow()
+            existing_node["last_seen"] = datetime.now(timezone.utc)
             bucket.remove(existing_node)
             bucket.append(existing_node)
             return
@@ -340,8 +340,8 @@ class Maga(asyncio.DatagramProtocol):
             bucket.append({
                 "id": node_id,
                 "addr": addr,
-                "last_seen": datetime.utcnow(),
-                "first_seen": datetime.utcnow(),
+                "last_seen": datetime.now(timezone.utc),
+                "first_seen": datetime.now(timezone.utc),
                 "response_count": 0
             })
             return
@@ -364,14 +364,14 @@ class Maga(asyncio.DatagramProtocol):
             bucket.append({
                 "id": node_id,
                 "addr": addr,
-                "last_seen": datetime.utcnow(),
-                "first_seen": datetime.utcnow(),
+                "last_seen": datetime.now(timezone.utc),
+                "first_seen": datetime.now(timezone.utc),
                 "response_count": 0
             })
         else:
             # Node responded, move it to the end and discard the new candidate
             bucket.remove(lru_node)
-            lru_node["last_seen"] = datetime.utcnow()
+            lru_node["last_seen"] = datetime.now(timezone.utc)
             bucket.append(lru_node)
 
     async def _default_handler(self, infohash, peer_addr):

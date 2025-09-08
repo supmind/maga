@@ -6,6 +6,7 @@ import collections
 import argparse
 
 from maga.crawler import Maga
+from maga.utils import proper_infohash
 from maga.downloader import get_metadata
 
 # Configure basic logging to see the output from the crawler and this script
@@ -67,7 +68,8 @@ async def metadata_downloader(task_queue):
     while True:
         try:
             infohash, peer_addr = await task_queue.get()
-            infohash_hex = binascii.hexlify(infohash).decode()
+            # proper_infohash ensures the hash is always uppercase hex
+            infohash_hex = proper_infohash(infohash)
 
             # The BoundedSet `add` method returns False if the item already exists.
             # We use it here to de-duplicate tasks from the queue and to mark

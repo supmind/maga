@@ -87,15 +87,15 @@ class WirePeerClient:
         msg = bytes([EXT_ID, self.ut_metadata]) + bencode({b"msg_type": 0, b"piece": piece})
         self.write_message(msg)
 
-    def pieces_complete(self):
+    async def pieces_complete(self):
         metainfo = b''.join(self.pieces)
 
         if len(metainfo) != self.metadata_size:
-            return self.close()
+            return await self.close()
 
         infohash = hashlib.sha1(metainfo).hexdigest()
         if binascii.unhexlify(infohash.upper()) != self.infohash:
-            return self.close()
+            return await self.close()
 
         return bdecode(metainfo)
 
@@ -108,7 +108,7 @@ class WirePeerClient:
                     self.handshaked = True
                     self.write_message(EXT_HANDSHAKE_MESSAGE)
                 else:
-                    return self.close()
+                    return await self.close()
 
             total_message_length, msg_id = struct.unpack("!IB", await self.reader.readexactly(5))
             payload_length = total_message_length - 1
@@ -124,9 +124,9 @@ class WirePeerClient:
                     if self.metadata_size > MAX_SIZE:
                         # Peer is trying to send a file that is too large.
                         # This is a common attack vector.
-                        return self.close()
+                        return await self.close()
                 except:
-                    return self.close()
+                    return await self.close()
                 self.pieces_num = math.ceil(self.metadata_size / BLOCK)
                 self.pieces = [False] * self.pieces_num
                 self.request_piece(0)
@@ -136,15 +136,15 @@ class WirePeerClient:
                 split_index = extend_payload.index(b"ee")+2
                 info = bdecode(extend_payload[:split_index])
                 if info[b'msg_type'] != MessageType.DATA:
-                    return self.close()
+                    return await self.close()
                 if info[b'piece'] != self.pieces_received_num:
-                    return self.close()
+                    return await self.close()
                 self.pieces[info[b'piece']] = extend_payload[split_index:]
             except:
-                return self.close()
+                return await self.close()
             self.pieces_received_num += 1
             if self.pieces_received_num == self.pieces_num:
-                return self.pieces_complete()
+                return await self.pieces_complete()
             else:
                 self.request_piece(self.pieces_received_num)
 

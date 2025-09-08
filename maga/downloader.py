@@ -119,6 +119,10 @@ class WirePeerClient:
                 try:
                     self.ut_metadata = get_ut_metadata(extend_payload)
                     self.metadata_size = get_metadata_size(extend_payload)
+                    if self.metadata_size > MAX_SIZE:
+                        # Peer is trying to send a file that is too large.
+                        # This is a common attack vector.
+                        return self.close()
                 except:
                     return self.close()
                 self.pieces_num = math.ceil(self.metadata_size / BLOCK)

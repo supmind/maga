@@ -6,7 +6,7 @@ import collections
 from datetime import datetime
 
 import aiohttp
-import bencode2 as bencoder
+from fastbencode import bencode
 from elasticsearch_async import AsyncElasticsearch
 from maga.crawler import Maga
 from maga.downloader import get_metadata
@@ -407,7 +407,7 @@ async def main():
                         try:
                             with open(file_path, "wb") as f:
                                 # 我们需要对包含info字典的顶层字典进行bencode编码
-                                f.write(bencoder.bencode(torrent_dict))
+                                f.write(bencode(torrent_dict))
 
                             # 打印摘要
                             print("=" * 30 + " 下载成功 " + "=" * 30)

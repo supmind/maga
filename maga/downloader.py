@@ -4,7 +4,7 @@ import binascii
 import struct
 import math
 
-import bencode2 as bencoder
+from fastbencode import bencode, bdecode
 from . import utils
 
 
@@ -18,7 +18,7 @@ BT_PROTOCOL = "BitTorrent protocol"
 BT_PROTOCOL_LEN = len(BT_PROTOCOL)
 EXT_ID = 20
 EXT_HANDSHAKE_ID = 0
-EXT_HANDSHAKE_MESSAGE = bytes([EXT_ID, EXT_HANDSHAKE_ID]) + bencoder.bencode({"m": {"ut_metadata": 1}})
+EXT_HANDSHAKE_MESSAGE = bytes([EXT_ID, EXT_HANDSHAKE_ID]) + bencode({b"m": {b"ut_metadata": 1}})
 
 BLOCK = math.pow(2, 14)
 MAX_SIZE = BLOCK * 1000
@@ -82,7 +82,7 @@ class WirePeerClient:
         self.writer.write(length + message)
 
     def request_piece(self, piece):
-        msg = bytes([EXT_ID, self.ut_metadata]) + bencoder.bencode({"msg_type": 0, "piece": piece})
+        msg = bytes([EXT_ID, self.ut_metadata]) + bencode({b"msg_type": 0, b"piece": piece})
         self.write_message(msg)
 
     def pieces_complete(self):
@@ -95,7 +95,7 @@ class WirePeerClient:
         if binascii.unhexlify(infohash.upper()) != self.infohash:
             return self.close()
 
-        return bencoder.bdecode(metainfo)
+        return bdecode(metainfo)
 
     async def work(self):
         self.writer.write(BT_HEADER + self.infohash + self.peer_id)
@@ -132,7 +132,7 @@ class WirePeerClient:
 
             try:
                 split_index = extend_payload.index(b"ee")+2
-                info = bencoder.bdecode(extend_payload[:split_index])
+                info = bdecode(extend_payload[:split_index])
                 if info[b'msg_type'] != MessageType.DATA:
                     return self.close()
                 if info[b'piece'] != self.pieces_received_num:

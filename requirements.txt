@@ -1,4 +1,4 @@
-bencode2
+fastbencode
 uvloop
 av
 aiohttp

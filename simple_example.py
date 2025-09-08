@@ -2,7 +2,7 @@ import asyncio
 import binascii
 import logging
 import signal
-from collections import deque
+import collections
 
 from maga.crawler import Maga
 from maga.downloader import get_metadata
@@ -15,9 +15,35 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# A simple set to keep track of infohashes we've already processed in this session
-# This helps avoid downloading the same metadata multiple times
-PROCESSED_INFOHASHES = set()
+class BoundedSet:
+    """
+    A set with a fixed maximum size. When full, adding a new item
+    discards the oldest item.
+    """
+    def __init__(self, max_size=1_000_000):
+        self.max_size = max_size
+        self.deque = collections.deque()
+        self.set = set()
+
+    def add(self, item):
+        if item in self.set:
+            return False
+
+        if len(self.deque) == self.max_size:
+            oldest = self.deque.popleft()
+            self.set.remove(oldest)
+
+        self.deque.append(item)
+        self.set.add(item)
+        return True
+
+    def __contains__(self, item):
+        return item in self.set
+
+
+# Use a BoundedSet to keep track of infohashes we've already processed.
+# This prevents memory from growing indefinitely.
+PROCESSED_INFOHASHES = BoundedSet(max_size=1_000_000)
 
 
 def format_bytes(size):
@@ -33,57 +59,78 @@ def format_bytes(size):
     return f"{size:.2f} {power_labels[n]}"
 
 
+async def metadata_downloader(task_queue):
+    """
+    This is the "consumer" or "worker". It pulls tasks from the queue
+    and downloads metadata.
+    """
+    while True:
+        try:
+            infohash, peer_addr = await task_queue.get()
+            infohash_hex = binascii.hexlify(infohash).decode()
+
+            # The BoundedSet `add` method returns False if the item already exists.
+            # We check here to avoid a race condition where multiple identical
+            # infohashes are added to the queue before the first one is processed.
+            if not PROCESSED_INFOHASHES.add(infohash_hex):
+                task_queue.task_done()
+                continue
+
+            log.info(f"Processing infohash: {infohash_hex} from peer {peer_addr}")
+
+            # Asynchronously download metadata from the announcing peer
+            loop = asyncio.get_running_loop()
+            info = await get_metadata(infohash, peer_addr[0], peer_addr[1], loop=loop, timeout=10)
+
+            if info:
+                name = info.get(b'name', b'Unknown').decode(errors='ignore')
+                if b'files' in info:
+                    num_files = len(info[b'files'])
+                    total_size = sum(f.get(b'length', 0) for f in info[b'files'])
+                else:
+                    num_files = 1
+                    total_size = info.get(b'length', 0)
+
+                log.info("=" * 30 + " METADATA DOWNLOADED " + "=" * 30)
+                log.info(f"  Name: {name}")
+                log.info(f"  Infohash: {infohash_hex}")
+                log.info(f"  Size: {format_bytes(total_size)}")
+                log.info(f"  Files: {num_files}")
+                log.info("=" * 82 + "\n")
+
+            # Notify the queue that this task is complete
+            task_queue.task_done()
+        except asyncio.CancelledError:
+            # Propagate cancellation
+            return
+        except Exception:
+            log.exception("Error in metadata_downloader worker.")
+            # Still need to mark task as done even if it failed
+            task_queue.task_done()
+
+
 class SimpleCrawler(Maga):
     """
-    A simple crawler that demonstrates core functionality.
+    This is the "producer". It discovers infohashes and puts them into
+    the task queue.
     """
-    def __init__(self, *args, **kwargs):
+    def __init__(self, task_queue, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.download_semaphore = asyncio.Semaphore(100)
+        self.task_queue = task_queue
 
     async def handler(self, infohash, addr, peer_addr=None):
         """
-        This is the main handler for discovered infohashes.
-        It's called by `handle_get_peers` and `handle_announce_peer` in the base class.
+        This handler is called for `announce_peer` messages.
+        It puts the discovered task into the queue for the workers to process.
         """
-        # Per the new requirement, we only want to download metadata for infohashes
-        # that are actively announced by a peer. These calls provide a `peer_addr`.
-        # If `peer_addr` is None, this infohash came from a `get_peers` request, and we ignore it.
         if not peer_addr:
             return
 
-        infohash_hex = binascii.hexlify(infohash).decode()
-
-        # Ignore if we've already processed this infohash
-        if infohash_hex in PROCESSED_INFOHASHES:
-            return
-
-        log.info(f"Discovered infohash via announce_peer: {infohash_hex} from peer {peer_addr}. Attempting metadata download.")
-
-        # Use a semaphore to limit the number of concurrent metadata downloads
-        async with self.download_semaphore:
-            # Asynchronously download metadata from the announcing peer
-            loop = asyncio.get_running_loop()
-            info = await get_metadata(infohash, peer_addr[0], peer_addr[1], loop=loop)
-
-        if info:
-            # Only add to the processed set if the download was successful
-            PROCESSED_INFOHASHES.add(infohash_hex)
-
-            name = info.get(b'name', b'Unknown').decode(errors='ignore')
-            if b'files' in info:
-                num_files = len(info[b'files'])
-                total_size = sum(f.get(b'length', 0) for f in info[b'files'])
-            else:
-                num_files = 1
-                total_size = info.get(b'length', 0)
-
-            log.info("=" * 30 + " METADATA DOWNLOADED " + "=" * 30)
-            log.info(f"  Name: {name}")
-            log.info(f"  Infohash: {infohash_hex}")
-            log.info(f"  Size: {format_bytes(total_size)}")
-            log.info(f"  Files: {num_files}")
-            log.info("=" * 82 + "\n")
+        try:
+            # Don't block, if the queue is full, just drop the task
+            self.task_queue.put_nowait((infohash, peer_addr))
+        except asyncio.QueueFull:
+            log.warning("Task queue is full, dropping new infohash.")
 
     def get_routing_table_stats(self):
         """
@@ -97,49 +144,70 @@ class SimpleCrawler(Maga):
         }
 
 
-async def print_stats(crawler):
+async def print_stats(crawler, task_queue):
     """
-    A periodic task to print statistics about the crawler.
+    A periodic task to print statistics about the crawler and the task queue.
     """
     while True:
-        await asyncio.sleep(30)  # Print stats every 30 seconds
+        await asyncio.sleep(30)
         stats = crawler.get_routing_table_stats()
         log.info(
-            f"[STATS] DHT Routing Table: "
-            f"{stats['total_nodes']} nodes in {stats['non_empty_buckets']} buckets. "
-            f"Processed {len(PROCESSED_INFOHASHES)} infohashes this session."
+            f"[STATS] DHT Nodes: {stats['total_nodes']} | "
+            f"Queue Size: {task_queue.qsize()}/{task_queue.maxsize} | "
+            f"Processed Hashes: {len(PROCESSED_INFOHASHES.deque)}"
         )
 
 
 async def main():
     """
-    The main entry point for the simple crawler example.
+    The main entry point for the producer-consumer based crawler.
     """
-    log.info("Starting the simple DHT crawler...")
+    log.info("Starting the advanced DHT crawler (Producer-Consumer Model)...")
     loop = asyncio.get_running_loop()
 
-    # Create an instance of our crawler
-    crawler = SimpleCrawler()
+    # Create a bounded queue to hold tasks
+    # The size of this queue is a buffer between discovery and downloading.
+    task_queue = asyncio.Queue(maxsize=1000)
 
-    # Run the crawler. This will start listening on a UDP port.
-    # We use a random available port by not specifying one.
+    # Create the crawler (producer) and pass it the queue
+    crawler = SimpleCrawler(task_queue=task_queue)
+
+    # Create a pool of workers (consumers)
+    # The number of workers is the concurrency limit for downloads.
+    num_workers = 100
+    workers = [
+        loop.create_task(metadata_downloader(task_queue))
+        for _ in range(num_workers)
+    ]
+
+    # Run the crawler
     await crawler.run()
     log.info(f"Crawler is running on port {crawler.transport.get_extra_info('sockname')[1]}")
 
-    # Start the periodic statistics printer task
-    stats_task = loop.create_task(print_stats(crawler))
+    # Start the periodic statistics printer
+    stats_task = loop.create_task(print_stats(crawler, task_queue))
 
-    log.info("Crawler started. Press Ctrl+C to stop.")
+    log.info(f"{num_workers} download workers started. Press Ctrl+C to stop.")
 
     # Set up signal handling for graceful shutdown
     stop = asyncio.Future()
     loop.add_signal_handler(signal.SIGINT, stop.set_result, None)
     await stop
 
-    log.info("Shutting down the crawler...")
-    stats_task.cancel()
+    log.info("Shutting down...")
+    # 1. Stop the crawler from accepting new connections
     crawler.stop()
-    log.info("Crawler stopped.")
+    # 2. Cancel the stats printer
+    stats_task.cancel()
+    # 3. Cancel the worker tasks
+    for worker in workers:
+        worker.cancel()
+    # 4. Wait for all workers to finish their cancellation
+    await asyncio.gather(*workers, return_exceptions=True)
+    log.info("All workers stopped.")
+    # 5. Wait for the queue to be fully processed (optional, but good practice)
+    await task_queue.join()
+    log.info("Crawler shut down gracefully.")
 
 
 if __name__ == "__main__":

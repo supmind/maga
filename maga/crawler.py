@@ -304,8 +304,9 @@ class Maga(asyncio.DatagramProtocol):
 
                 args = msg.get(constants.KRPC_R, {})
                 if constants.KRPC_VALUES in args:
-                    for peer in utils.split_peers(args[constants.KRPC_VALUES]):
-                        peers.add(peer)
+                    for peer_data_string in args[constants.KRPC_VALUES]:
+                        for peer in utils.split_peers(peer_data_string):
+                            peers.add(peer)
 
                 if constants.KRPC_NODES in args:
                     for node_id, ip, port in utils.split_nodes(args[constants.KRPC_NODES]):
@@ -318,7 +319,7 @@ class Maga(asyncio.DatagramProtocol):
             # Prepare for the next hop
             nodes_to_query = new_nodes_found
 
-        return len(peers)
+        return peers
 
     def _get_bucket_index(self, node_id):
         distance = utils.get_distance(self.node_id, node_id)

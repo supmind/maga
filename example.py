@@ -288,7 +288,8 @@ async def peer_checker_task(crawler, es_client):
                 infohash_bytes = binascii.unhexlify(infohash_hex)
 
                 print(f"[Peer Checker] 正在检查: {infohash_hex}")
-                peer_count = await crawler.get_peers_recursive(infohash_bytes)
+                peers = await crawler.get_peers_recursive(infohash_bytes)
+                peer_count = len(peers)
 
                 # 更新文档
                 update_body = {

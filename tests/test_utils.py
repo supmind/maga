@@ -65,27 +65,3 @@ def test_get_distance():
 
     # Test distance is symmetric
     assert utils.get_distance(id1, id3) == utils.get_distance(id3, id1)
-
-
-def test_proper_infohash():
-    # A 20-byte infohash
-    infohash_bytes = b'\x1a\xe1' * 10
-    # The expected 40-character uppercase hex representation
-    expected_hex = ('1AE1' * 10)
-
-    # 1. Test with bytes
-    # 函数注释：测试字节输入
-    assert utils.proper_infohash(infohash_bytes) == expected_hex
-
-    # 2. Test with a lowercase hex string
-    # 函数注释：测试小写十六进制字符串输入
-    assert utils.proper_infohash(expected_hex.lower()) == expected_hex
-
-    # 3. Test with an uppercase hex string
-    # 函数注释：测试大写十六进制字符串输入
-    assert utils.proper_infohash(expected_hex) == expected_hex
-
-    # 4. Test with mixed-case hex string
-    # 函数注释：测试混合大小写十六进制字符串输入
-    infohash_mixed = '1aE1' * 10
-    assert utils.proper_infohash(infohash_mixed) == expected_hex

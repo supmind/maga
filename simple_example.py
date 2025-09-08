@@ -41,8 +41,7 @@ class BoundedSet:
         return item in self.set
 
 
-# Use a BoundedSet to keep track of infohashes we've already processed.
-# This prevents memory from growing indefinitely.
+# Use a BoundedSet to keep track of infohashes to prevent memory leaks.
 PROCESSED_INFOHASHES = BoundedSet(max_size=1_000_000)
 
 
@@ -69,8 +68,10 @@ async def metadata_downloader(task_queue):
             infohash, peer_addr = await task_queue.get()
             infohash_hex = binascii.hexlify(infohash).decode()
 
-            # First, check if this infohash has been successfully processed already.
-            if infohash_hex in PROCESSED_INFOHASHES:
+            # The BoundedSet `add` method returns False if the item already exists.
+            # We use it here to de-duplicate tasks from the queue and to mark
+            # an infohash as "seen" before we attempt to download it.
+            if not PROCESSED_INFOHASHES.add(infohash_hex):
                 task_queue.task_done()
                 continue
 
@@ -78,11 +79,9 @@ async def metadata_downloader(task_queue):
 
             # Asynchronously download metadata from the announcing peer
             loop = asyncio.get_running_loop()
-            info = await get_metadata(infohash, peer_addr[0], peer_addr[1], loop=loop, timeout=10)
+            info = await get_metadata(infohash, peer_addr[0], peer_addr[1], loop=loop, timeout=2)
 
             if info:
-                # Only add the infohash to the processed set on successful download.
-                PROCESSED_INFOHASHES.add(infohash_hex)
                 name = info.get(b'name', b'Unknown').decode(errors='ignore')
                 if b'files' in info:
                     num_files = len(info[b'files'])
@@ -101,11 +100,9 @@ async def metadata_downloader(task_queue):
             # Notify the queue that this task is complete
             task_queue.task_done()
         except asyncio.CancelledError:
-            # Propagate cancellation
             return
         except Exception:
             log.exception("Error in metadata_downloader worker.")
-            # Still need to mark task as done even if it failed
             task_queue.task_done()
 
 
@@ -127,10 +124,10 @@ class SimpleCrawler(Maga):
             return
 
         try:
-            # Don't block, if the queue is full, just drop the task
             self.task_queue.put_nowait((infohash, peer_addr))
         except asyncio.QueueFull:
-            log.warning("Task queue is full, dropping new infohash.")
+            pass # Drop the task if the queue is full
+
 
     def get_routing_table_stats(self):
         """
@@ -165,16 +162,14 @@ async def main():
     log.info("Starting the advanced DHT crawler (Producer-Consumer Model)...")
     loop = asyncio.get_running_loop()
 
-    # Create a bounded queue to hold tasks
-    # The size of this queue is a buffer between discovery and downloading.
-    task_queue = asyncio.Queue(maxsize=1000)
+    # A bounded queue to hold tasks, which acts as a buffer.
+    task_queue = asyncio.Queue(maxsize=2000)
 
-    # Create the crawler (producer) and pass it the queue
+    # The crawler acts as the producer
     crawler = SimpleCrawler(task_queue=task_queue)
 
-    # Create a pool of workers (consumers)
-    # The number of workers is the concurrency limit for downloads.
-    num_workers = 100
+    # The number of workers determines the download concurrency
+    num_workers = 200
     workers = [
         loop.create_task(metadata_downloader(task_queue))
         for _ in range(num_workers)
@@ -189,23 +184,17 @@ async def main():
 
     log.info(f"{num_workers} download workers started. Press Ctrl+C to stop.")
 
-    # Set up signal handling for graceful shutdown
+    # Handle graceful shutdown
     stop = asyncio.Future()
     loop.add_signal_handler(signal.SIGINT, stop.set_result, None)
     await stop
 
     log.info("Shutting down...")
-    # 1. Stop the crawler from accepting new connections
-    crawler.stop()
-    # 2. Cancel the stats printer
     stats_task.cancel()
-    # 3. Cancel the worker tasks
     for worker in workers:
         worker.cancel()
-    # 4. Wait for all workers to finish their cancellation
+    crawler.stop()
     await asyncio.gather(*workers, return_exceptions=True)
-    log.info("All workers stopped.")
-    # 5. Wait for the queue to be fully processed (optional, but good practice)
     await task_queue.join()
     log.info("Crawler shut down gracefully.")
 

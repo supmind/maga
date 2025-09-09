@@ -63,6 +63,7 @@ class Maga(asyncio.DatagramProtocol):
         self.__running = False
         self.interval = interval
         self.find_nodes_task = None
+        self.cleanup_task = None
 
     def connection_made(self, transport):
         self.transport = transport
@@ -153,6 +154,8 @@ class Maga(asyncio.DatagramProtocol):
         self.__running = False
         if self.find_nodes_task:
             self.find_nodes_task.cancel()
+        if self.cleanup_task:
+            self.cleanup_task.cancel()
         if self.transport:
             self.transport.close()
 
@@ -165,6 +168,40 @@ class Maga(asyncio.DatagramProtocol):
                     self.find_node(addr=node)
             except Exception:
                 self.log.exception("Error in Crawler auto_find_nodes loop")
+
+    async def _cleanup_rate_limiter(self):
+        """
+        Periodically cleans up the rate_limiter dictionary to remove stale entries.
+        """
+        while self.__running:
+            try:
+                await asyncio.sleep(constants.RATE_LIMIT_CLEANUP_INTERVAL)
+
+                now = time.monotonic()
+                initial_size = len(self.rate_limiter)
+
+                # Create a list of IPs to remove to avoid modifying the dict while iterating
+                stale_ips = [
+                    ip for ip, timestamps in self.rate_limiter.items()
+                    if not timestamps or timestamps[-1] < now - constants.RATE_LIMIT_WINDOW
+                ]
+
+                for ip in stale_ips:
+                    del self.rate_limiter[ip]
+
+                final_size = len(self.rate_limiter)
+                if initial_size > 0:
+                    self.log.info(
+                        f"Rate limiter cleanup: "
+                        f"Removed {len(stale_ips)} stale entries. "
+                        f"Size changed from {initial_size} to {final_size}."
+                    )
+
+            except asyncio.CancelledError:
+                self.log.info("Rate limiter cleanup task cancelled.")
+                break
+            except Exception:
+                self.log.exception("Error in rate limiter cleanup task.")
 
     async def run(self, port=6881):
         _, _ = await self.loop.create_datagram_endpoint(
@@ -179,6 +216,11 @@ class Maga(asyncio.DatagramProtocol):
         self.background_tasks.add(task)
         task.add_done_callback(self.background_tasks.discard)
         self.find_nodes_task = task
+
+        cleanup_task = asyncio.ensure_future(self._cleanup_rate_limiter(), loop=self.loop)
+        self.background_tasks.add(cleanup_task)
+        cleanup_task.add_done_callback(self.background_tasks.discard)
+        self.cleanup_task = cleanup_task
 
     def handle_response(self, tid, r_args, addr):
         # A response from a node we know about is a good sign.

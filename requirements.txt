@@ -4,3 +4,4 @@ aiohttp
 elasticsearch-async
 pytest
 pytest-asyncio
+fastbencode

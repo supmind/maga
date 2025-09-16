@@ -13,7 +13,8 @@ from main import is_porn_video
 from porn_classifier_utils import RELEASE_CODE_PATTERN
 
 # API端点，用于添加新任务
-API_URL = "http://47.79.229.105:8000/tasks/"
+API_URL = "http://47.79.230.210:8000/tasks/"
+API_KEY = "a_very_secret_and_complex_key_for_dev"
 # 日志文件名
 LOG_FILE = 'classification_log.csv'
 
@@ -114,8 +115,12 @@ async def add_task_to_downloader(infohash_hex, torrent_file_path):
     """
     异步函数，用于将infohash和种子文件上传到下载器以添加新任务
     """
+    headers = {
+        'accept': 'application/json',
+        'X-API-Key': API_KEY
+    }
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=headers) as session:
             # 构建 multipart/form-data 请求体
             data = aiohttp.FormData()
             data.add_field('infohash', infohash_hex)
@@ -198,10 +203,9 @@ async def main():
                     # 使用分类器检查文件名, 并记录结果, 但不提交任务
                     # ======================================================
                     if is_porn_torrent(info, name):
-                        print(f"  [检查] 分类器检测到可疑内容。")
-                        # print(f"  [检查] 分类器检测到可疑内容, 准备提交任务。")
-                        # # 传入infohash和文件路径
-                        # await add_task_to_downloader(infohash_hex, file_path)
+                        print(f"  [检查] 分类器检测到可疑内容, 准备提交任务。")
+                        # 传入infohash和文件路径
+                        await add_task_to_downloader(infohash_hex, file_path)
                     else:
                         print(f"  [检查] 分类器未检测到可疑内容。")
 
